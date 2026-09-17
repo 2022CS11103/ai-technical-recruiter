@@ -1,4 +1,12 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
+/**
+ * In the browser we call same-origin `/api/...` and Next.js rewrites to FastAPI.
+ * That avoids cross-port fetch failures (Cursor Simple Browser, CORS, etc.).
+ * Server-side code can still hit the API directly via NEXT_PUBLIC_API_URL.
+ */
+const API_URL =
+  typeof window === "undefined"
+    ? process.env.NEXT_PUBLIC_API_URL || process.env.API_PROXY_TARGET || "http://127.0.0.1:8001"
+    : "";
 
 export function getToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -31,12 +39,13 @@ export async function api<T = unknown>(
     res = await fetch(url, { ...options, headers });
   } catch {
     throw new Error(
-      `Cannot reach API at ${API_URL}. Start it with: uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload`
+      `Cannot reach API (tried ${url || path}). Keep uvicorn on port 8001 and refresh http://localhost:3000/interview/try`
     );
   }
   if (!res.ok) {
     const detail = await res.json().catch(() => ({ detail: res.statusText }));
-    const msg = typeof detail.detail === "string" ? detail.detail : JSON.stringify(detail.detail || detail);
+    const msg =
+      typeof detail.detail === "string" ? detail.detail : JSON.stringify(detail.detail || detail);
     throw new Error(msg || "Request failed");
   }
   return res.json();

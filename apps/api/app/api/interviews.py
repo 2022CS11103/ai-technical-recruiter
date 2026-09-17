@@ -39,6 +39,7 @@ from app.models import (
 )
 from app.schemas import AnswerIn, ConsentIn, InterviewCreate, InterviewOut, OverviewStats, ReportOverride
 from app.services.ai_factory import get_stt, get_tts, get_tts_for_interviewer, make_agent
+from app.core.config import get_settings
 
 router = APIRouter(tags=["interviews"])
 log = logging.getLogger("interview.conversation")
@@ -154,15 +155,18 @@ async def _load_context(db: AsyncSession, session: InterviewSession) -> dict[str
 
 
 async def _speak(text: str, interviewer_name: str | None = None) -> str | None:
-    """Synthesize speech with a hard timeout — never block the interview."""
+    """Synthesize speech — edge-tts; fail soft so interview never hangs."""
+    if not text or not text.strip():
+        return None
     try:
         audio = await asyncio.wait_for(
             get_tts_for_interviewer(interviewer_name).synthesize(text),
-            timeout=2.5,
+            timeout=12.0,
         )
         if audio:
             return base64.b64encode(audio).decode("ascii")
-    except Exception:
+    except Exception as exc:
+        print(f"[tts] failed: {exc}", flush=True)
         return None
     return None
 
@@ -541,10 +545,11 @@ async def _start_session(session: InterviewSession, db: AsyncSession) -> dict[st
             state = await _get_state(db, session)
             reply = state.last_question or (state.conversation_history[-1]["content"] if state.conversation_history else "")
             if reply:
+                audio_b64 = await _speak(reply, context.get("interviewer_name", "Sarah"))
                 return {
                     "reply": reply,
                     "state": state.model_dump(),
-                    "audio_base64": None,
+                    "audio_base64": audio_b64,
                     "interviewer_name": context.get("interviewer_name", "Sarah"),
                     "candidate_name": context.get("candidate_name", ""),
                     "already_started": True,
@@ -577,11 +582,11 @@ async def _start_session(session: InterviewSession, db: AsyncSession) -> dict[st
     )
     db.add(q)
     await db.commit()
-    # Skip waiting on TTS for greeting — browser voice speaks instantly; keeps UI unstuck
+    audio_b64 = await _speak(reply, context.get("interviewer_name", "Sarah"))
     return {
         "reply": reply,
         "state": state.model_dump(),
-        "audio_base64": None,
+        "audio_base64": audio_b64,
         "interviewer_name": context.get("interviewer_name", "Sarah"),
         "candidate_name": context.get("candidate_name", ""),
     }
@@ -673,14 +678,18 @@ async def _answer(session: InterviewSession, answer_text: str, db: AsyncSession)
         await _persist_state(db, session, state)
         finished = await _finish(session, db, state)
         finished["reply"] = reply
+        finished["audio_base64"] = await _speak(
+            reply or "Thanks for your time today. That wraps up the interview.",
+            context.get("interviewer_name", "Sarah"),
+        )
         return finished
 
     # Meta turns (repeat / wait / clarify) should not create a new scored question row.
     if meta.get("action") in {"REPEAT", "WAIT", "CLARIFY", "CLARIFY_SCOPE", "REDIRECT", "COMPANY_QA", "PAUSED"}:
         await _persist_state(db, session, state)
         await db.commit()
-        # Prefer fast browser TTS on client; don't block reply on edge-tts
-        return {"reply": spoken, "meta": meta, "state": state.model_dump(), "audio_base64": None}
+        audio_b64 = await _speak(spoken, context.get("interviewer_name", "Sarah"))
+        return {"reply": spoken, "meta": meta, "state": state.model_dump(), "audio_base64": audio_b64}
 
     q = InterviewQuestion(
         session_id=session.id,
@@ -695,7 +704,8 @@ async def _answer(session: InterviewSession, answer_text: str, db: AsyncSession)
     db.add(q)
     await _persist_state(db, session, state)
     await db.commit()
-    return {"reply": spoken, "meta": meta, "state": state.model_dump(), "audio_base64": None}
+    audio_b64 = await _speak(spoken, context.get("interviewer_name", "Sarah"))
+    return {"reply": spoken, "meta": meta, "state": state.model_dump(), "audio_base64": audio_b64}
 
 
 async def _interrupt_session(session: InterviewSession, db: AsyncSession) -> dict[str, Any]:
@@ -986,11 +996,25 @@ async def override_report(
 async def stt_endpoint(token: str, file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     await _session_by_token(db, token)
     data = await file.read()
+    if not data:
+        return {"text": "", "error": "empty_audio"}
+    settings = get_settings()
+    if settings.use_mock_stt:
+        return {
+            "text": "",
+            "error": "stt_not_configured",
+            "hint": "Set LLM_API_KEY or STT_API_KEY in apps/api/.env (Groq key) and restart the API",
+        }
     try:
         text = await get_stt().transcribe(data, file.content_type or "audio/webm")
-    except Exception:
-        text = ""
-    return {"text": text}
+    except Exception as exc:
+        print(f"[stt] failed: {exc}", flush=True)
+        return {"text": "", "error": "stt_failed"}
+    cleaned = (text or "").strip()
+    if cleaned.startswith("[voice transcription unavailable"):
+        return {"text": "", "error": "stt_mock"}
+    _chat_log("YOU", cleaned, note="stt transcript")
+    return {"text": cleaned}
 
 
 @router.websocket("/ws/interviews/{token}")

@@ -1,7 +1,9 @@
 """Application settings — secrets from environment only."""
 from functools import lru_cache
+import os
 from typing import List
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -57,6 +59,15 @@ class Settings(BaseSettings):
     demo_email: str = "recruiter@example.com"
     demo_password: str = "demo1234"
     demo_name: str = "Demo Recruiter"
+
+    @model_validator(mode="after")
+    def fill_keys_from_aliases(self):
+        # Allow GROQ_API_KEY / OPENAI_API_KEY as drop-in aliases
+        if not self.llm_api_key:
+            self.llm_api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        if not self.stt_api_key:
+            self.stt_api_key = self.llm_api_key or os.getenv("GROQ_API_KEY") or ""
+        return self
 
     @property
     def cors_origin_list(self) -> List[str]:

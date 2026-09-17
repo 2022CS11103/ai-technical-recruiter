@@ -69,6 +69,25 @@ async def health():
     return {"status": "ok", "service": settings.app_name}
 
 
+@app.get("/api/v1/ai/status")
+async def ai_status():
+    """Frontend uses this to choose Whisper STT vs browser speech + show mock vs live LLM."""
+    s = get_settings()
+    key = bool(s.llm_api_key or s.stt_api_key)
+    return {
+        "llm": bool(s.llm_api_key),
+        "stt": bool(s.stt_api_key or s.llm_api_key),
+        "tts": s.tts_provider in {"edge", "elevenlabs"},
+        "provider": s.llm_provider if s.llm_api_key else "mock",
+        "model": s.llm_model if s.llm_api_key else "mock",
+        "stt_model": s.stt_model if key else "mock",
+        "ready": bool(s.llm_api_key),
+        "hint": None
+        if s.llm_api_key
+        else "Add LLM_API_KEY (Groq) to apps/api/.env and restart the API",
+    }
+
+
 @app.get("/ready")
 async def ready():
     checks = {"database": False, "redis": False}

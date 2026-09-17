@@ -62,13 +62,25 @@ export default function CandidateInterviewPage() {
   const [micHint, setMicHint] = useState("Mic idle");
   const [micLevel, setMicLevel] = useState(0);
   const [micReady, setMicReady] = useState(false);
-  const [showText, setShowText] = useState(false);
   const [answer, setAnswer] = useState("");
   const [transcript, setTranscript] = useState<Array<{ role: string; content: string }>>([]);
   const [secondsLeft, setSecondsLeft] = useState(30 * 60);
   const [error, setError] = useState("");
   const [consent, setConsent] = useState(false);
   const [uploading, setUploading] = useState<"jd" | "resume" | null>(null);
+  const [voiceLang, setVoiceLang] = useState<"en-IN" | "hi-IN" | "en-US">("en-IN");
+  const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
+  const [micDeviceId, setMicDeviceId] = useState<string>("");
+  const [aiStatus, setAiStatus] = useState<{
+    llm: boolean;
+    stt: boolean;
+    tts: boolean;
+    provider: string;
+    model: string;
+    ready: boolean;
+    hint?: string | null;
+  } | null>(null);
+  const answerBoxRef = useRef<HTMLTextAreaElement | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const recognitionRef = useRef<any>(null);
@@ -84,6 +96,17 @@ export default function CandidateInterviewPage() {
   const micAudioCtxRef = useRef<AudioContext | null>(null);
   const micAnalyserRef = useRef<AnalyserNode | null>(null);
   const micRafRef = useRef<number | null>(null);
+  const micLevelRef = useRef(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const speechStartedRef = useRef(false);
+  const vadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
+  const voiceLangRef = useRef(voiceLang);
+  voiceLangRef.current = voiceLang;
+  const micDeviceIdRef = useRef(micDeviceId);
+  micDeviceIdRef.current = micDeviceId;
 
   const timer = useMemo(() => {
     const m = Math.floor(secondsLeft / 60).toString().padStart(2, "0");
@@ -97,6 +120,30 @@ export default function CandidateInterviewPage() {
     const id = setInterval(() => setSecondsLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(id);
   }, [phase, connection]);
+
+  useEffect(() => {
+    api<{
+      llm: boolean;
+      stt: boolean;
+      tts: boolean;
+      provider: string;
+      model: string;
+      ready: boolean;
+      hint?: string | null;
+    }>("/api/v1/ai/status", { auth: false })
+      .then(setAiStatus)
+      .catch(() =>
+        setAiStatus({
+          llm: false,
+          stt: false,
+          tts: false,
+          provider: "unknown",
+          model: "unknown",
+          ready: false,
+          hint: "API offline — start uvicorn on :8001",
+        })
+      );
+  }, []);
 
   const clearSilenceTimer = useCallback(() => {
     if (silenceTimerRef.current) {
@@ -113,56 +160,144 @@ export default function CandidateInterviewPage() {
     setMicLevel(0);
   }, []);
 
-  const startMicMeter = useCallback(async () => {
+  /** Fully release mic hardware so SpeechRecognition can own the device (Windows conflict). */
+  const releaseMicHardware = useCallback(async () => {
     stopMicMeter();
-    try {
-      if (!micStreamRef.current) {
-        micStreamRef.current = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true },
-          video: false,
-        });
-      }
-      if (!micAudioCtxRef.current) {
-        micAudioCtxRef.current = new AudioContext();
-      }
-      const ctx = micAudioCtxRef.current;
-      if (ctx.state === "suspended") await ctx.resume();
-      if (!micAnalyserRef.current) {
-        const source = ctx.createMediaStreamSource(micStreamRef.current);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.75;
-        source.connect(analyser);
-        micAnalyserRef.current = analyser;
-      }
-      const analyser = micAnalyserRef.current;
-      const data = new Uint8Array(analyser.frequencyBinCount);
-      setMicReady(true);
-
-      const tick = () => {
-        analyser.getByteFrequencyData(data);
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) sum += data[i];
-        const avg = sum / data.length / 255;
-        setMicLevel(Math.min(1, avg * 2.2));
-        micRafRef.current = requestAnimationFrame(tick);
-      };
-      tick();
-    } catch {
-      setMicReady(false);
-      setMicHint("Mic blocked — allow microphone in browser settings");
+    micStreamRef.current?.getTracks().forEach((t) => t.stop());
+    micStreamRef.current = null;
+    micAnalyserRef.current = null;
+    if (micAudioCtxRef.current) {
+      await micAudioCtxRef.current.close().catch(() => null);
+      micAudioCtxRef.current = null;
     }
   }, [stopMicMeter]);
 
+  /** Ask for permission once, then release — timed out so Cursor preview cannot hang forever. */
+  const ensureMicPermission = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMicReady(false);
+      setMicHint("This browser has no mic API — type your answer below");
+      return false;
+    }
+    try {
+      const stream = await Promise.race([
+        navigator.mediaDevices.getUserMedia({ audio: true, video: false }),
+        new Promise<never>((_, reject) =>
+          window.setTimeout(() => reject(new Error("mic permission timed out")), 2500)
+        ),
+      ]);
+      stream.getTracks().forEach((t) => t.stop());
+      setMicReady(true);
+      return true;
+    } catch (e) {
+      setMicReady(false);
+      const msg = e instanceof Error ? e.message : "mic error";
+      setMicHint(`Mic not available (${msg}) — type your answer below`);
+      return false;
+    }
+  }, []);
+
+  /** Live RMS meter — reuses an open stream so turns stay seamless. */
+  const startLevelMeter = useCallback(
+    async (deviceId?: string) => {
+      stopMicMeter();
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          setMicReady(false);
+          setMicHint("No mic API — use Chrome for voice");
+          return null;
+        }
+
+        const liveTracks = micStreamRef.current?.getAudioTracks().filter((t) => t.readyState === "live") ?? [];
+        const wantSwitch =
+          Boolean(deviceId) &&
+          liveTracks[0] &&
+          liveTracks[0].getSettings?.().deviceId &&
+          liveTracks[0].getSettings().deviceId !== deviceId;
+
+        if (!liveTracks.length || wantSwitch) {
+          micStreamRef.current?.getTracks().forEach((t) => t.stop());
+          if (micAudioCtxRef.current) {
+            await micAudioCtxRef.current.close().catch(() => null);
+            micAudioCtxRef.current = null;
+          }
+          micAnalyserRef.current = null;
+
+          const constraints: MediaStreamConstraints = {
+            audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+            video: false,
+          };
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
+          micStreamRef.current = stream;
+          stream.getAudioTracks().forEach((t) => {
+            t.enabled = true;
+          });
+        }
+
+        const stream = micStreamRef.current!;
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        setMicDevices(devices.filter((d) => d.kind === "audioinput"));
+        const track = stream.getAudioTracks()[0];
+        const settingsId = track?.getSettings?.().deviceId;
+        if (settingsId) setMicDeviceId(settingsId);
+
+        if (!micAudioCtxRef.current || micAudioCtxRef.current.state === "closed") {
+          const AC = window.AudioContext || (window as any).webkitAudioContext;
+          micAudioCtxRef.current = new AC();
+        }
+        const ctx = micAudioCtxRef.current;
+        if (ctx.state === "suspended") await ctx.resume();
+
+        if (!micAnalyserRef.current) {
+          const source = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 2048;
+          analyser.smoothingTimeConstant = 0.2;
+          const gain = ctx.createGain();
+          gain.gain.value = 8;
+          source.connect(gain);
+          gain.connect(analyser);
+          micAnalyserRef.current = analyser;
+        }
+
+        const analyser = micAnalyserRef.current;
+        const data = new Uint8Array(analyser.fftSize);
+        const tick = () => {
+          if (!micAnalyserRef.current) return;
+          analyser.getByteTimeDomainData(data);
+          let sumSq = 0;
+          let peak = 0;
+          for (let i = 0; i < data.length; i++) {
+            const v = (data[i] - 128) / 128;
+            sumSq += v * v;
+            peak = Math.max(peak, Math.abs(v));
+          }
+          const rms = Math.sqrt(sumSq / data.length);
+          const level = Math.min(1, Math.max(rms * 12, peak * 2.2));
+          micLevelRef.current = level;
+          setMicLevel(level);
+          micRafRef.current = requestAnimationFrame(tick);
+        };
+        tick();
+        setMicReady(true);
+        return stream;
+      } catch (e) {
+        setMicReady(false);
+        const msg = e instanceof Error ? e.message : "mic error";
+        setMicHint(`Mic blocked (${msg}) — allow microphone in the address bar`);
+        setError("Allow microphone for this site, then refresh and start again.");
+        console.error("[mic] getUserMedia failed", e);
+        return null;
+      }
+    },
+    [stopMicMeter]
+  );
+
   useEffect(() => {
     return () => {
-      stopMicMeter();
-      micStreamRef.current?.getTracks().forEach((t) => t.stop());
-      micStreamRef.current = null;
-      micAudioCtxRef.current?.close().catch(() => null);
-      micAudioCtxRef.current = null;
+      void releaseMicHardware();
     };
-  }, [stopMicMeter]);
+  }, [releaseMicHardware]);
 
   const speakBrowser = useCallback((text: string, voiceHint: string, playId: number) => {
     return new Promise<void>(async (resolve) => {
@@ -271,20 +406,38 @@ export default function CandidateInterviewPage() {
   const stopListening = useCallback(() => {
     listeningRef.current = false;
     clearSilenceTimer();
-    stopMicMeter();
+    if (vadTimerRef.current) {
+      clearTimeout(vadTimerRef.current);
+      vadTimerRef.current = null;
+    }
+    speechStartedRef.current = false;
+    // Keep level meter running so bars stay live; only stop recognition/recorder
     try {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.onstop = null;
+        mediaRecorderRef.current.stop();
+      }
+    } catch {
+      /* ignore */
+    }
+    mediaRecorderRef.current = null;
+    recordedChunksRef.current = [];
+    try {
+      recognitionRef.current?.abort?.();
       recognitionRef.current?.stop();
     } catch {
       /* ignore */
     }
-  }, [clearSilenceTimer, stopMicMeter]);
+    recognitionRef.current = null;
+  }, [clearSilenceTimer]);
 
   const openMicAfterAgent = useCallback(() => {
     setAgentState("listening");
-    setMicHint("Mic on — speak your answer (say “please repeat” if you need it again)");
+    setMicHint("Your turn — mic is open, speak now");
+    // Slight delay so Sarah's last audio fully stops before we capture
     window.setTimeout(() => {
       if (!processingRef.current) startListeningRef.current();
-    }, 350);
+    }, 400);
   }, []);
 
   /** After Next.js remounts on URL change, restore question + reopen mic. */
@@ -402,34 +555,160 @@ export default function CandidateInterviewPage() {
     }, SILENCE_MS);
   }, [clearSilenceTimer, submitAnswer]);
 
-  const startListening = useCallback(() => {
+  const submitAnswerRef = useRef(submitAnswer);
+  submitAnswerRef.current = submitAnswer;
+
+  const flushVoiceRecording = useCallback(async () => {
+    const activeToken = tokenRef.current;
+    if (!activeToken || processingRef.current) return;
+    const rec = mediaRecorderRef.current;
+    if (!rec || rec.state === "inactive") {
+      // Recorder not ready — reopen automatically
+      window.setTimeout(() => startListeningRef.current(), 300);
+      return;
+    }
+    if (vadTimerRef.current) {
+      clearTimeout(vadTimerRef.current);
+      vadTimerRef.current = null;
+    }
+    setMicHint("Got it — transcribing…");
+    listeningRef.current = false;
+    await new Promise<void>((resolve) => {
+      rec.onstop = () => resolve();
+      try {
+        rec.stop();
+      } catch {
+        resolve();
+      }
+    });
+    mediaRecorderRef.current = null;
+    const blob = new Blob(recordedChunksRef.current, { type: rec.mimeType || "audio/webm" });
+    recordedChunksRef.current = [];
+    speechStartedRef.current = false;
+    if (blob.size < 800) {
+      setMicHint("Didn’t catch that — speak again");
+      window.setTimeout(() => startListeningRef.current(), 400);
+      return;
+    }
+    try {
+      const fd = new FormData();
+      fd.append("file", blob, "answer.webm");
+      const res = await fetch(`${API_URL}/api/v1/interview-links/${activeToken}/stt`, {
+        method: "POST",
+        body: fd,
+      });
+      const data = await res.json();
+      const text = String(data.text || "").trim();
+      if (!text) {
+        if (data.error === "stt_not_configured") {
+          setMicHint("Speak again — or type below (add Groq key for Whisper STT)");
+          setError("Add LLM_API_KEY in apps/api/.env for voice→text, then restart API.");
+        } else {
+          setMicHint("Couldn’t hear clearly — speak again");
+        }
+        window.setTimeout(() => startListeningRef.current(), 500);
+        return;
+      }
+      setPartialHeard(text);
+      setMicHint(`You said: “${text}”`);
+      console.log("%cYOU (stt):", "color:#2a9d8f;font-weight:bold", text);
+      await submitAnswerRef.current(text);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "STT failed");
+      setMicHint("Transcription failed — speak again or type below");
+      window.setTimeout(() => startListeningRef.current(), 500);
+    }
+  }, []);
+
+  /** Auto-open mic: MediaRecorder+Whisper when key set, else browser speech. */
+  const startServerVoiceCapture = useCallback(async () => {
     if (processingRef.current) return;
+    const activeToken = tokenRef.current;
+    if (!activeToken) return;
+
+    stopListening();
+    answerBufferRef.current = "";
+    lastHeardRef.current = "";
+    speechStartedRef.current = false;
+    recordedChunksRef.current = [];
+    setPartialHeard("");
+    setAgentState("listening");
+    listeningRef.current = true;
+    setMicHint("Listening — speak naturally, then pause ~2s");
+
+    if (audioRef.current) audioRef.current.pause();
+    if (typeof window !== "undefined") window.speechSynthesis?.cancel();
+
+    const stream = await startLevelMeter(micDeviceIdRef.current || undefined);
+    if (!stream) {
+      setMicHint("Mic blocked — allow mic in the address bar, then Sarah will hear you next turn");
+      return;
+    }
+
+    const useWhisper = Boolean(aiStatus?.stt);
+
+    if (useWhisper) {
+      try {
+        const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus"
+          : MediaRecorder.isTypeSupported("audio/webm")
+            ? "audio/webm"
+            : "";
+        const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        mediaRecorderRef.current = recorder;
+        recorder.ondataavailable = (ev) => {
+          if (ev.data && ev.data.size > 0) recordedChunksRef.current.push(ev.data);
+        };
+        recorder.start(250);
+        setMicReady(true);
+
+        const armVadCommit = () => {
+          if (vadTimerRef.current) clearTimeout(vadTimerRef.current);
+          vadTimerRef.current = setTimeout(() => {
+            if (!listeningRef.current || processingRef.current || !speechStartedRef.current) return;
+            if (micLevelRef.current > 0.04) {
+              armVadCommit();
+              return;
+            }
+            void flushVoiceRecording();
+          }, SILENCE_MS);
+        };
+
+        const watch = () => {
+          if (!listeningRef.current || processingRef.current) return;
+          if (micLevelRef.current > 0.05) {
+            if (!speechStartedRef.current) {
+              speechStartedRef.current = true;
+              setMicHint("Hearing you… pause when finished");
+              setPartialHeard("…");
+            }
+            armVadCommit();
+          }
+          window.setTimeout(watch, 100);
+        };
+        watch();
+        return;
+      } catch (e) {
+        console.warn("[mic] MediaRecorder failed, falling back to browser speech", e);
+      }
+    }
+
+    // Browser speech path (no Groq key / MediaRecorder failed)
     const SR =
       typeof window !== "undefined"
         ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
         : null;
     if (!SR) {
-      setError("Browser speech recognition unavailable — use Chrome, or open text fallback.");
-      setShowText(true);
-      setAgentState("idle");
+      setMicHint("Type your answer below — this browser has no speech engine");
       return;
     }
-    stopListening();
-    answerBufferRef.current = "";
-    lastHeardRef.current = "";
+
     const recognition = new SR();
     recognitionRef.current = recognition;
-    recognition.continuous = true;
+    recognition.continuous = false;
     recognition.interimResults = true;
-    recognition.lang = "en-IN";
-    listeningRef.current = true;
-    setAgentState("listening");
-    setPartialHeard("");
-    setMicHint("Mic on — speak now (bars move when voice is audible)");
-    void startMicMeter();
-
-    if (audioRef.current) audioRef.current.pause();
-    if (typeof window !== "undefined") window.speechSynthesis?.cancel();
+    recognition.maxAlternatives = 1;
+    recognition.lang = voiceLangRef.current || "en-IN";
 
     recognition.onresult = (event: any) => {
       let interim = "";
@@ -446,35 +725,20 @@ export default function CandidateInterviewPage() {
       lastHeardRef.current = heard;
       setPartialHeard(heard);
       if (heard) {
-        setMicHint("Hearing you ✓ — pause ~2s when finished");
-        console.log("[mic] heard:", heard);
-      }
-      if (chunk.trim() || interim.trim()) {
+        setMicHint("Hearing you… pause when finished");
         armSilenceCommit();
       }
     };
     recognition.onerror = (ev: any) => {
       const err = ev?.error as string | undefined;
-      if (err === "no-speech" || err === "aborted") {
-        if (err === "no-speech") {
-          setMicHint("Mic on — no speech heard yet, keep talking");
-        }
-        return;
-      }
-      if (err === "not-allowed") {
-        setMicHint("Mic blocked — allow microphone in the browser");
-        setError("Microphone permission denied. Allow mic access, then restart the interview.");
+      if (err === "no-speech" || err === "aborted") return;
+      if (err === "not-allowed" || err === "service-not-allowed") {
+        setMicHint("Mic permission denied — allow mic, or type below");
         listeningRef.current = false;
-        setAgentState("idle");
-        stopMicMeter();
         return;
       }
-      // Recoverable: keep interview hands-free by restarting mic
-      setMicHint("Reconnecting mic…");
-      if (!processingRef.current) {
-        window.setTimeout(() => {
-          if (!processingRef.current) startListeningRef.current();
-        }, 500);
+      if (err === "network") {
+        setMicHint("Speech offline — add Groq key for Whisper, or type below");
       }
     };
     recognition.onend = () => {
@@ -482,7 +746,6 @@ export default function CandidateInterviewPage() {
         try {
           recognition.start();
         } catch {
-          setMicHint("Reconnecting mic…");
           window.setTimeout(() => {
             if (!processingRef.current) startListeningRef.current();
           }, 400);
@@ -491,13 +754,17 @@ export default function CandidateInterviewPage() {
     };
     try {
       recognition.start();
+      setMicReady(true);
     } catch {
-      setMicHint("Reconnecting mic…");
-      window.setTimeout(() => {
-        if (!processingRef.current) startListeningRef.current();
-      }, 400);
+      setMicHint("Could not open mic — type your answer below");
+      listeningRef.current = false;
     }
-  }, [stopListening, armSilenceCommit, startMicMeter, stopMicMeter]);
+  }, [stopListening, startLevelMeter, flushVoiceRecording, aiStatus?.stt, armSilenceCommit]);
+
+  const startListening = useCallback(() => {
+    if (processingRef.current) return;
+    void startServerVoiceCapture();
+  }, [startServerVoiceCapture]);
 
   useEffect(() => {
     startListeningRef.current = startListening;
@@ -562,8 +829,8 @@ export default function CandidateInterviewPage() {
     setMicHint("Starting…");
     setError("");
     setConnection("connecting");
-    // Mic permission while we still have the user-gesture from the click
-    void startMicMeter().then(stopMicMeter);
+    // User-gesture: open mic now and KEEP it for the whole interview
+    void startLevelMeter();
     try {
       const created = await api<any>("/api/v1/interview-links/self-serve", {
         method: "POST",
@@ -883,10 +1150,10 @@ export default function CandidateInterviewPage() {
             micLevel={micLevel}
             listening={agentState === "listening"}
           />
-          <VoiceMeter active={agentState === "listening" || micReady} level={micLevel} audible={micLevel > 0.08} />
+          <VoiceMeter active={agentState === "listening" || micReady} level={micLevel} audible={micLevel > 0.04} />
           <p className="text-sm text-[var(--muted)]">
             {agentState === "listening"
-              ? micLevel > 0.08
+              ? micLevel > 0.04
                 ? "Voice audible ✓"
                 : "Listening… speak louder if bars stay flat"
               : agentState === "speaking"
@@ -921,11 +1188,21 @@ export default function CandidateInterviewPage() {
                 : "var(--line)",
           }}
         >
+          {aiStatus && !aiStatus.ready && (
+            <p className="mb-3 text-sm text-[var(--muted)]">
+              Tip: add Groq <code>LLM_API_KEY</code> for Whisper STT + smarter follow-ups. Mic still opens automatically.
+            </p>
+          )}
+          {aiStatus?.ready && (
+            <p className="mb-3 text-sm text-[var(--ok)]">
+              Live AI: {aiStatus.provider}/{aiStatus.model} · Whisper · TTS
+            </p>
+          )}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs uppercase tracking-[0.16em] text-[var(--muted)]">Your mic</p>
             <p
               className={`text-sm ${
-                micLevel > 0.08 || partialHeard ? "text-[var(--ok)]" : "text-[var(--muted)]"
+                micLevel > 0.04 || partialHeard ? "text-[var(--ok)]" : "text-[var(--muted)]"
               }`}
             >
               {micHint}
@@ -939,42 +1216,60 @@ export default function CandidateInterviewPage() {
               }`}
               style={{
                 background:
-                  micLevel > 0.08
+                  micLevel > 0.04
                     ? "color-mix(in oklab, var(--ok) 40%, transparent)"
                     : agentState === "listening"
                       ? "color-mix(in oklab, var(--accent-2) 25%, transparent)"
                       : "var(--panel)",
-                borderColor: micLevel > 0.08 ? "var(--ok)" : "var(--line)",
+                borderColor: micLevel > 0.04 ? "var(--ok)" : "var(--line)",
                 transform: `scale(${1 + Math.min(0.35, micLevel * 0.5)})`,
                 transition: "transform 80ms linear",
               }}
               aria-label="Microphone activity"
             >
-              <MicIcon hot={micLevel > 0.08} />
+              <MicIcon hot={micLevel > 0.04} />
             </div>
             <div className="min-w-0 flex-1">
-              <VoiceMeter active={agentState === "listening"} level={micLevel} audible={micLevel > 0.08} />
+              <VoiceMeter active={agentState === "listening"} level={micLevel} audible={micLevel > 0.04} />
               <p className="mt-3 min-h-[2.5rem] text-base leading-relaxed text-[var(--ink)]">
                 {agentState === "thinking" && lastAnswer
                   ? `You said: “${lastAnswer}”`
                   : partialHeard
                     ? `Hearing: “${partialHeard}”`
                     : agentState === "listening"
-                      ? "Speak now — bars jump when your voice is audible."
+                      ? "Your mic is open — speak, then pause ~2 seconds."
                       : agentState === "speaking"
-                        ? `${interviewer} is talking. Your mic opens when they finish.`
+                        ? `${interviewer} is talking… your mic opens when they finish.`
                         : lastAnswer
                           ? `Last answer: “${lastAnswer}”`
                           : "Mic idle."}
               </p>
             </div>
           </div>
-          {agentState === "listening" && !partialHeard && micLevel < 0.05 && (
-            <p className="mt-2 text-sm text-[var(--muted)]">
-              Bars flat? Check browser mic permission — mic turns on automatically after each question.
-            </p>
-          )}
         </section>
+
+        {/* Optional typed fallback — voice is primary */}
+        <form
+          className="panel grid w-full gap-3 border border-[var(--line)] p-4 text-left"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!answer.trim()) return;
+            submitAnswer(answer);
+            setAnswer("");
+          }}
+        >
+          <p className="text-xs uppercase tracking-[0.16em] text-[var(--muted)]">Or type your answer</p>
+          <textarea
+            ref={answerBoxRef}
+            className="input min-h-24"
+            value={answer}
+            onChange={(e) => setAnswer(e.target.value)}
+            placeholder="Only if voice fails…"
+          />
+          <button className="btn btn-primary w-fit" type="submit" disabled={!answer.trim() || agentState === "thinking"}>
+            Send answer
+          </button>
+        </form>
 
         <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
           <button className="btn btn-secondary" onClick={endInterview}>
@@ -983,7 +1278,7 @@ export default function CandidateInterviewPage() {
         </div>
 
         <p className="text-center text-sm text-[var(--muted)]">
-          After you finish answering, pause ~2 seconds and {interviewer} continues. Say “please repeat” anytime.
+          After {interviewer} finishes, your mic opens automatically. Pause ~2s when you’re done speaking.
         </p>
 
         {/* Live running transcript — always on so screen never feels blank */}
@@ -1002,29 +1297,6 @@ export default function CandidateInterviewPage() {
             </div>
           )}
         </section>
-
-        <button className="text-sm text-[var(--muted)] underline" onClick={() => setShowText((v) => !v)}>
-          {showText ? "Hide text fallback" : "Need text fallback?"}
-        </button>
-
-        {showText && (
-          <form
-            className="grid w-full gap-3 text-left"
-            onSubmit={(e) => {
-              e.preventDefault();
-              submitAnswer(answer);
-              setAnswer("");
-            }}
-          >
-            <textarea
-              className="input min-h-24"
-              value={answer}
-              onChange={(e) => setAnswer(e.target.value)}
-              placeholder="Type your answer if voice fails…"
-            />
-            <button className="btn btn-primary w-fit">Send</button>
-          </form>
-        )}
 
         {error && <p className="text-sm text-[var(--danger)]">{error}</p>}
       </div>
