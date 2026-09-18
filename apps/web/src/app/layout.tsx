@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Figtree, Syne } from "next/font/google";
+import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
 
 const syne = Syne({
@@ -15,14 +16,17 @@ const figtree = Figtree({
 });
 
 export const metadata: Metadata = {
-  title: "AI Technical Recruiter",
+  title: "ZARA — AI Technical Recruiter",
   description: "Conduct adaptive technical interviews with AI.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body className={`${syne.variable} ${figtree.variable} antialiased`}>{children}</body>
+      <body className={`${syne.variable} ${figtree.variable} antialiased`}>
+        {children}
+        <Toaster />
+      </body>
     </html>
   );
 }

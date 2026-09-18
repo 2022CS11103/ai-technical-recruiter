@@ -5,12 +5,12 @@ import { DashboardShell } from "@/components/DashboardShell";
 import { api, API_URL, getToken } from "@/lib/api";
 
 export default function KnowledgePage() {
-  const [rows, setRows] = useState<any[]>([]);
+  const [rows, setRows] = useState<Record<string, unknown>[]>([]);
   const [file, setFile] = useState<File | null>(null);
   const [msg, setMsg] = useState("");
 
   async function refresh() {
-    setRows(await api("/api/v1/knowledge"));
+    setRows(await api<Record<string, unknown>[]>("/api/v1/knowledge"));
   }
   useEffect(() => {
     refresh().catch(() => setRows([]));
@@ -49,9 +49,9 @@ export default function KnowledgePage() {
       </form>
       <div className="mt-6 grid gap-3">
         {rows.map((r) => (
-          <div key={r.id} className="panel p-4">
-            <p className="font-semibold">{r.title}</p>
-            <p className="text-sm text-[var(--muted)]">{r.knowledge_type}</p>
+          <div key={String(r.id)} className="panel p-4">
+            <p className="font-semibold">{String(r.title ?? "")}</p>
+            <p className="text-sm text-[var(--muted)]">{String(r.knowledge_type ?? "")}</p>
           </div>
         ))}
       </div>

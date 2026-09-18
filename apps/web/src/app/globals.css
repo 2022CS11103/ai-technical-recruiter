@@ -1,21 +1,42 @@
 @import "tailwindcss";
 
 :root {
-  --bg: #071018;
-  --bg-elevated: #0d1b24;
-  --panel: #112531;
-  --ink: #e7f0f3;
-  --muted: #8aa0ab;
-  --accent: #2ec4b6;
-  --accent-2: #f4a261;
-  --line: rgba(232, 241, 242, 0.12);
-  --danger: #e76f51;
-  --ok: #2a9d8f;
+  --bg: #090a0d;
+  --bg-elevated: #10131b;
+  --panel: #131720;
+  --ink: #f1f5f9;
+  --muted: #94a3b8;
+  --accent: #60a5fa;
+  --accent-2: #a78bfa;
+  --line: rgba(255, 255, 255, 0.1);
+  --danger: #f87171;
+  --ok: #34d399;
+
+  --background: #090a0d;
+  --foreground: #f1f5f9;
+  --card: #131720;
+  --border: rgba(255, 255, 255, 0.1);
+  --input: rgba(255, 255, 255, 0.12);
+  --muted-bg: #161b26;
+  --muted-foreground: #94a3b8;
+  --sidebar: #0c0e14;
+  --sidebar-accent: rgba(255, 255, 255, 0.06);
+  --primary: #3b82f6;
+  --primary-foreground: #ffffff;
 }
 
 @theme inline {
-  --color-background: var(--bg);
-  --color-foreground: var(--ink);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-muted: var(--muted-bg);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
   --font-sans: var(--font-body);
   --font-display: var(--font-display);
 }
@@ -34,10 +55,7 @@ body {
 }
 
 body {
-  background:
-    radial-gradient(1200px 600px at 10% -10%, rgba(46, 196, 182, 0.18), transparent 55%),
-    radial-gradient(900px 500px at 90% 0%, rgba(244, 162, 97, 0.12), transparent 50%),
-    linear-gradient(180deg, #071018 0%, #0a161e 50%, #071018 100%);
+  background: #090a0d;
 }
 
 a {
@@ -49,10 +67,16 @@ a {
   font-family: var(--font-display), var(--font-body), sans-serif;
 }
 
+.font-mono-zara {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
 .panel {
-  background: color-mix(in oklab, var(--panel) 88%, transparent);
+  background: color-mix(in oklab, var(--panel) 92%, transparent);
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: 12px;
 }
 
 .btn {
@@ -70,9 +94,13 @@ a {
   transform: translateY(-1px);
 }
 
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
 .btn-primary {
-  background: var(--accent);
-  color: #04201c;
+  background: #3b82f6;
+  color: #fff;
 }
 
 .btn-secondary {
@@ -83,9 +111,9 @@ a {
 
 .input {
   width: 100%;
-  border-radius: 12px;
+  border-radius: 10px;
   border: 1px solid var(--line);
-  background: rgba(7, 16, 24, 0.65);
+  background: rgba(9, 10, 13, 0.65);
   color: var(--ink);
   padding: 0.8rem 0.95rem;
 }
@@ -102,18 +130,74 @@ a {
   font-size: 0.875rem;
 }
 
-@keyframes pulse-ring {
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(96, 165, 250, 0.22);
+  background: rgba(59, 130, 246, 0.12);
+  color: #93c5fd;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.75rem;
+}
+
+.status-pill.listening {
+  border-color: rgba(52, 211, 153, 0.22);
+  background: rgba(16, 185, 129, 0.12);
+  color: #6ee7b7;
+}
+
+.status-pill.thinking {
+  border-color: rgba(192, 132, 252, 0.22);
+  background: rgba(139, 92, 246, 0.12);
+  color: #d8b4fe;
+}
+
+.avatar-pulse::before,
+.avatar-pulse::after {
+  content: "";
+  position: absolute;
+  inset: -10px;
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  border-radius: 999px;
+  animation: avatarPulse 2.5s ease-out infinite;
+}
+
+.avatar-pulse::after {
+  animation-delay: 1.2s;
+}
+
+@keyframes avatarPulse {
   0% {
-    transform: scale(0.9);
-    opacity: 0.7;
+    transform: scale(0.8);
+    opacity: 0.8;
   }
-  70% {
-    transform: scale(1.25);
-    opacity: 0;
-  }
+  70%,
   100% {
+    transform: scale(1.35);
     opacity: 0;
   }
+}
+
+@keyframes waveBounce {
+  0%,
+  100% {
+    transform: scaleY(0.55);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+.zara-wave-bar {
+  display: inline-block;
+  transform-origin: center bottom;
+}
+
+.zara-wave-anim {
+  animation-name: waveBounce;
+  animation-iteration-count: infinite;
+  animation-timing-function: ease-in-out;
 }
 
 .mic-pulse::after {
@@ -121,8 +205,8 @@ a {
   position: absolute;
   inset: -8px;
   border-radius: 999px;
-  border: 2px solid var(--accent);
-  animation: pulse-ring 1.6s ease-out infinite;
+  border: 2px solid #60a5fa;
+  animation: avatarPulse 1.6s ease-out infinite;
 }
 
 .voice-meter {
@@ -139,4 +223,55 @@ a {
   width: 4px;
   border-radius: 999px;
   transition: height 70ms linear, background 120ms ease;
+}
+
+.zara-room {
+  position: relative;
+  min-height: 100svh;
+  overflow: hidden;
+  background: #090a0d;
+  color: #fff;
+}
+
+.zara-glow {
+  pointer-events: none;
+  position: absolute;
+  left: 50%;
+  top: 33%;
+  width: 520px;
+  height: 520px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: rgba(59, 130, 246, 0.05);
+  filter: blur(64px);
+}
+
+.status-success {
+  border-color: rgba(52, 211, 153, 0.3);
+  background: rgba(16, 185, 129, 0.12);
+  color: #6ee7b7;
+}
+
+.status-info {
+  border-color: rgba(96, 165, 250, 0.3);
+  background: rgba(59, 130, 246, 0.12);
+  color: #93c5fd;
+}
+
+.status-violet {
+  border-color: rgba(167, 139, 250, 0.3);
+  background: rgba(139, 92, 246, 0.12);
+  color: #d8b4fe;
+}
+
+.status-danger {
+  border-color: rgba(248, 113, 113, 0.3);
+  background: rgba(239, 68, 68, 0.12);
+  color: #fca5a5;
+}
+
+.status-neutral {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: #94a3b8;
 }

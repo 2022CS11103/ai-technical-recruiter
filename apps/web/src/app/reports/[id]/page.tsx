@@ -5,15 +5,27 @@ import { useParams } from "next/navigation";
 import { DashboardShell } from "@/components/DashboardShell";
 import { api } from "@/lib/api";
 
+type ReportData = {
+  overall_score?: number | string;
+  recommendation?: string;
+  human_override?: string;
+  strengths?: string[];
+  weaknesses?: string[];
+  evidence?: string[];
+  resume_validation?: unknown;
+  recommended_next_step?: string;
+  full_report?: { competency_scores?: Record<string, number | string> };
+};
+
 export default function ReportPage() {
   const params = useParams<{ id: string }>();
-  const [report, setReport] = useState<Record<string, any> | null>(null);
+  const [report, setReport] = useState<ReportData | null>(null);
   const [override, setOverride] = useState("yes");
   const [notes, setNotes] = useState("");
   const [msg, setMsg] = useState("");
 
   useEffect(() => {
-    api(`/api/v1/reports/${params.id}`).then(setReport).catch(() => setReport(null));
+    api<ReportData>(`/api/v1/reports/${params.id}`).then(setReport).catch(() => setReport(null));
   }, [params.id]);
 
   async function onOverride(e: FormEvent) {
@@ -23,8 +35,8 @@ export default function ReportPage() {
       body: JSON.stringify({ human_override: override, recruiter_notes: notes }),
     });
     setMsg("Override saved. Final hiring decisions remain with humans.");
-    const refreshed = await api(`/api/v1/reports/${params.id}`);
-    setReport(refreshed as Record<string, any>);
+    const refreshed = await api<ReportData>(`/api/v1/reports/${params.id}`);
+    setReport(refreshed);
   }
 
   if (!report) {
@@ -80,7 +92,7 @@ export default function ReportPage() {
           <p className="mt-3 text-sm text-[var(--danger)]">{(report.weaknesses || []).join(" · ")}</p>
           <h3 className="mt-6 font-semibold">Evidence</h3>
           <ul className="mt-2 list-disc space-y-2 pl-5 text-sm text-[var(--muted)]">
-            {(report.evidence || []).map((e: string, i: number) => (
+            {(report.evidence || []).map((e, i) => (
               <li key={i}>{e}</li>
             ))}
           </ul>

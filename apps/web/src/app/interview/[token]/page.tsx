@@ -1,10 +1,70 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { useParams } from "next/navigation";
 import { API_URL, api } from "@/lib/api";
+import { InterviewerAvatar } from "@/components/interview/InterviewerAvatar";
+import { Waveform } from "@/components/interview/Waveform";
 
 type Phase = "setup" | "preparing" | "live" | "done" | "error";
+type VoiceLang = "en-IN" | "hi-IN" | "en-US";
+
+type InterviewInfo = {
+  role?: string;
+  candidate_name?: string;
+  interviewer_name?: string;
+  duration_minutes?: number;
+  token?: string;
+};
+
+type InterviewSnap = {
+  reply?: string;
+  interviewer_name?: string;
+  candidate_name?: string;
+  role?: string;
+  duration_minutes?: number;
+};
+
+type SpeechRecognitionResultLike = {
+  isFinal: boolean;
+  0: { transcript: string };
+};
+
+type SpeechRecognitionEventLike = {
+  resultIndex: number;
+  results: {
+    length: number;
+    [index: number]: SpeechRecognitionResultLike;
+  };
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  maxAlternatives: number;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: { error?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort?: () => void;
+};
+
+type SpeechWindow = Window & {
+  webkitAudioContext?: typeof AudioContext;
+  SpeechRecognition?: new () => SpeechRecognitionLike;
+  webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+};
+
+type AnswerApiResponse = {
+  status?: string;
+  reply?: string;
+  audio_base64?: string | null;
+  interviewer_name?: string;
+  candidate_name?: string;
+};
 
 const SAMPLE_JD = "";
 const SAMPLE_RESUME = "";
@@ -19,7 +79,7 @@ function snapKey(token: string) {
   return `atr-interview-snap:${token}`;
 }
 
-function saveInterviewSnap(token: string, data: Record<string, unknown>) {
+function saveInterviewSnap(token: string, data: InterviewSnap & Record<string, unknown>) {
   try {
     sessionStorage.setItem(snapKey(token), JSON.stringify(data));
   } catch {
@@ -27,10 +87,10 @@ function saveInterviewSnap(token: string, data: Record<string, unknown>) {
   }
 }
 
-function loadInterviewSnap(token: string): any | null {
+function loadInterviewSnap(token: string): InterviewSnap | null {
   try {
     const raw = sessionStorage.getItem(snapKey(token));
-    return raw ? JSON.parse(raw) : null;
+    return raw ? (JSON.parse(raw) as InterviewSnap) : null;
   } catch {
     return null;
   }
@@ -47,7 +107,7 @@ export default function CandidateInterviewPage() {
   const [jdFileName, setJdFileName] = useState("");
   const [resumeFileName, setResumeFileName] = useState("");
   const [interviewer, setInterviewer] = useState<"Sarah" | "Rahul">("Sarah");
-  const [info, setInfo] = useState<any>(null);
+  const [info, setInfo] = useState<InterviewInfo | null>(null);
   const [connection, setConnection] = useState<"offline" | "connecting" | "live">(
     initialToken ? "connecting" : "offline"
   );
@@ -68,9 +128,10 @@ export default function CandidateInterviewPage() {
   const [error, setError] = useState("");
   const [consent, setConsent] = useState(false);
   const [uploading, setUploading] = useState<"jd" | "resume" | null>(null);
-  const [voiceLang, setVoiceLang] = useState<"en-IN" | "hi-IN" | "en-US">("en-IN");
+  const [voiceLang, setVoiceLang] = useState<VoiceLang>("en-IN");
   const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
   const [micDeviceId, setMicDeviceId] = useState<string>("");
+  const [transcriptOpen, setTranscriptOpen] = useState(true);
   const [aiStatus, setAiStatus] = useState<{
     llm: boolean;
     stt: boolean;
@@ -83,7 +144,7 @@ export default function CandidateInterviewPage() {
   const answerBoxRef = useRef<HTMLTextAreaElement | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const recognitionRef = useRef<any>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const listeningRef = useRef(false);
   const processingRef = useRef(false);
   const answerBufferRef = useRef("");
@@ -172,31 +233,6 @@ export default function CandidateInterviewPage() {
     }
   }, [stopMicMeter]);
 
-  /** Ask for permission once, then release — timed out so Cursor preview cannot hang forever. */
-  const ensureMicPermission = useCallback(async () => {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setMicReady(false);
-      setMicHint("This browser has no mic API — type your answer below");
-      return false;
-    }
-    try {
-      const stream = await Promise.race([
-        navigator.mediaDevices.getUserMedia({ audio: true, video: false }),
-        new Promise<never>((_, reject) =>
-          window.setTimeout(() => reject(new Error("mic permission timed out")), 2500)
-        ),
-      ]);
-      stream.getTracks().forEach((t) => t.stop());
-      setMicReady(true);
-      return true;
-    } catch (e) {
-      setMicReady(false);
-      const msg = e instanceof Error ? e.message : "mic error";
-      setMicHint(`Mic not available (${msg}) — type your answer below`);
-      return false;
-    }
-  }, []);
-
   /** Live RMS meter — reuses an open stream so turns stay seamless. */
   const startLevelMeter = useCallback(
     async (deviceId?: string) => {
@@ -242,7 +278,11 @@ export default function CandidateInterviewPage() {
         if (settingsId) setMicDeviceId(settingsId);
 
         if (!micAudioCtxRef.current || micAudioCtxRef.current.state === "closed") {
-          const AC = window.AudioContext || (window as any).webkitAudioContext;
+          const AC = window.AudioContext || (window as SpeechWindow).webkitAudioContext;
+          if (!AC) {
+            setMicHint("AudioContext unavailable in this browser");
+            return null;
+          }
           micAudioCtxRef.current = new AC();
         }
         const ctx = micAudioCtxRef.current;
@@ -450,7 +490,7 @@ export default function CandidateInterviewPage() {
       const snap = loadInterviewSnap(activeToken);
       if (snap?.reply) {
         setInterviewer((snap.interviewer_name || "Sarah") as "Sarah" | "Rahul");
-        setInfo((prev: any) => ({
+        setInfo((prev) => ({
           ...prev,
           role: snap.role || prev?.role,
           candidate_name: snap.candidate_name || prev?.candidate_name,
@@ -461,11 +501,11 @@ export default function CandidateInterviewPage() {
         if (snap.duration_minutes) setSecondsLeft(snap.duration_minutes * 60);
       } else {
         try {
-          const info = await api<any>(`/api/v1/interview-links/${activeToken}`, { auth: false });
+          const info = await api<InterviewInfo>(`/api/v1/interview-links/${activeToken}`, { auth: false });
           setInfo(info);
           setInterviewer((info.interviewer_name || "Sarah") as "Sarah" | "Rahul");
           setSecondsLeft((info.duration_minutes || 30) * 60);
-          const res = await api<any>(`/api/v1/interview-links/${activeToken}/start`, {
+          const res = await api<AnswerApiResponse>(`/api/v1/interview-links/${activeToken}/start`, {
             method: "POST",
             auth: false,
           });
@@ -508,7 +548,7 @@ export default function CandidateInterviewPage() {
       setAgentState("thinking");
       console.log("%cYOU:", "color:#2a9d8f;font-weight:bold", text.trim());
       try {
-        const res = await api<any>(`/api/v1/interview-links/${token}/answer`, {
+        const res = await api<AnswerApiResponse>(`/api/v1/interview-links/${token}/answer`, {
           method: "POST",
           body: JSON.stringify({ answer_text: text }),
           auth: false,
@@ -523,10 +563,11 @@ export default function CandidateInterviewPage() {
           await playAgentSpeech(bye, res.audio_base64, interviewer);
           return;
         }
-        console.log("%cAI:", "color:#2ec4b6;font-weight:bold", res.reply);
-        setTranscript((t) => [...t, { role: "interviewer", content: res.reply }]);
+        const reply = res.reply || "Thanks — let's continue.";
+        console.log("%cAI:", "color:#2ec4b6;font-weight:bold", reply);
+        setTranscript((t) => [...t, { role: "interviewer", content: reply }]);
         setMicHint(`${interviewer} is speaking…`);
-        await playAgentSpeech(res.reply, res.audio_base64, interviewer);
+        await playAgentSpeech(reply, res.audio_base64, interviewer);
         openMicAfterAgent();
       } catch (e) {
         console.error("answer failed", e);
@@ -694,10 +735,8 @@ export default function CandidateInterviewPage() {
     }
 
     // Browser speech path (no Groq key / MediaRecorder failed)
-    const SR =
-      typeof window !== "undefined"
-        ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
-        : null;
+    const speechWin = window as SpeechWindow;
+    const SR = speechWin.SpeechRecognition || speechWin.webkitSpeechRecognition;
     if (!SR) {
       setMicHint("Type your answer below — this browser has no speech engine");
       return;
@@ -710,7 +749,7 @@ export default function CandidateInterviewPage() {
     recognition.maxAlternatives = 1;
     recognition.lang = voiceLangRef.current || "en-IN";
 
-    recognition.onresult = (event: any) => {
+    recognition.onresult = (event) => {
       let interim = "";
       let chunk = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -729,8 +768,8 @@ export default function CandidateInterviewPage() {
         armSilenceCommit();
       }
     };
-    recognition.onerror = (ev: any) => {
-      const err = ev?.error as string | undefined;
+    recognition.onerror = (ev) => {
+      const err = ev?.error;
       if (err === "no-speech" || err === "aborted") return;
       if (err === "not-allowed" || err === "service-not-allowed") {
         setMicHint("Mic permission denied — allow mic, or type below");
@@ -832,7 +871,7 @@ export default function CandidateInterviewPage() {
     // User-gesture: open mic now and KEEP it for the whole interview
     void startLevelMeter();
     try {
-      const created = await api<any>("/api/v1/interview-links/self-serve", {
+      const created = await api<InterviewInfo & { token: string }>("/api/v1/interview-links/self-serve", {
         method: "POST",
         auth: false,
         body: JSON.stringify({
@@ -904,7 +943,7 @@ export default function CandidateInterviewPage() {
         /* ignore */
       }
 
-      const res = await api<any>(`/api/v1/interview-links/${activeToken}/start`, {
+      const res = await api<AnswerApiResponse>(`/api/v1/interview-links/${activeToken}/start`, {
         method: "POST",
         auth: false,
       });
@@ -915,8 +954,11 @@ export default function CandidateInterviewPage() {
       setPhase("live");
       setConnection("live");
       setInterviewer((res.interviewer_name || name || "Sarah") as "Sarah" | "Rahul");
-      setInfo((prev: any) => {
-        const next = { ...prev, candidate_name: res.candidate_name || prev?.candidate_name };
+      setInfo((prev) => {
+        const next: InterviewInfo = {
+          ...prev,
+          candidate_name: res.candidate_name || prev?.candidate_name,
+        };
         saveInterviewSnap(activeToken, {
           reply: res.reply,
           interviewer_name: res.interviewer_name || name,
@@ -966,8 +1008,8 @@ export default function CandidateInterviewPage() {
       return;
     }
 
-    api(`/api/v1/interview-links/${initialToken}`, { auth: false })
-      .then(async (data: any) => {
+    api<InterviewInfo>(`/api/v1/interview-links/${initialToken}`, { auth: false })
+      .then(async (data) => {
         setInfo(data);
         setInterviewer((data.interviewer_name || "Sarah") as "Sarah" | "Rahul");
         setSecondsLeft((data.duration_minutes || 30) * 60);
@@ -1089,20 +1131,44 @@ export default function CandidateInterviewPage() {
           Usually this means the API is unreachable. Keep the API running on port{" "}
           <code>8001</code>, then open the setup page again.
         </p>
-        <a className="btn btn-primary mt-6 inline-flex" href="/interview/try">
+        <Link className="btn btn-primary mt-6 inline-flex" href="/interview/try">
           Back to setup
-        </a>
+        </Link>
       </Shell>
     );
   }
 
   if (phase === "done") {
     return (
-      <Shell>
-        <Brand />
-        <h1 className="font-display mt-8 text-4xl">Interview complete</h1>
-        <p className="mt-3 text-[var(--muted)]">Thanks for speaking with {interviewer}.</p>
-      </Shell>
+      <div className="zara-room grid place-items-center p-5" data-testid="candidate-complete-room">
+        <div className="w-full max-w-lg text-center">
+          <div className="mx-auto grid size-16 place-items-center rounded-full border border-emerald-400/25 bg-emerald-400/10 text-emerald-300 text-2xl">
+            ✓
+          </div>
+          <p className="mt-8 font-mono-zara text-[10px] text-emerald-300">Interview complete</p>
+          <h1 className="mt-3 text-3xl font-semibold tracking-tight">Thanks for your time.</h1>
+          <p className="mt-4 text-sm leading-6 text-slate-400">
+            Your responses have been submitted. The hiring team will be in touch with next steps.
+          </p>
+          <div className="mt-8 rounded-lg border border-white/10 bg-white/[.03] p-5 text-left text-sm">
+            <div className="flex justify-between">
+              <span className="text-slate-400">Interviewer</span>
+              <span>{interviewer}</span>
+            </div>
+            <div className="mt-3 flex justify-between">
+              <span className="text-slate-400">Role</span>
+              <span>{info?.role || "Technical interview"}</span>
+            </div>
+            <div className="mt-3 flex justify-between">
+              <span className="text-slate-400">Time left</span>
+              <span>{timer}</span>
+            </div>
+          </div>
+          <Link className="btn btn-primary mt-6 inline-flex w-full" href="/interview/try">
+            Back to start
+          </Link>
+        </div>
+      </div>
     );
   }
 
@@ -1110,147 +1176,139 @@ export default function CandidateInterviewPage() {
     agentState === "speaking"
       ? `${interviewer} is speaking`
       : agentState === "thinking"
-        ? `${interviewer} is thinking…`
+        ? "Thinking…"
         : agentState === "listening"
-          ? "Your turn — mic is listening"
-          : "Paused";
+          ? "Listening…"
+          : "Connecting…";
+
+  const statusClass =
+    agentState === "listening" ? "listening" : agentState === "thinking" ? "thinking" : "";
+
+  const qIndex = Math.min(transcript.filter((t) => t.role === "interviewer").length || 1, 8);
+  const progressPct = Math.max(12, (qIndex / 8) * 100);
 
   return (
-    <Shell>
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <Brand />
-        <div className="flex items-center gap-4 text-sm text-[var(--muted)]">
-          <span
-            className="rounded-full px-3 py-1 text-[var(--ink)]"
-            style={{
-              background:
-                agentState === "listening"
-                  ? "color-mix(in oklab, var(--accent-2) 30%, transparent)"
-                  : agentState === "speaking"
-                    ? "color-mix(in oklab, var(--accent) 30%, transparent)"
-                    : "var(--panel)",
-            }}
-          >
-            {statusLabel}
+    <div className="zara-room" data-testid="candidate-active-room">
+      <div className="zara-glow" />
+
+      <header className="relative flex h-16 items-center justify-between border-b border-white/10 px-5 sm:px-8">
+        <div>
+          <span className="font-mono-zara text-sm font-semibold tracking-[.28em]">ZARA</span>
+          <span className="ml-4 hidden border-l border-white/15 pl-4 text-xs text-slate-500 sm:inline">
+            {info?.role || "Technical interview"}
           </span>
-          <span className="font-display text-xl text-[var(--ink)]">{timer}</span>
         </div>
-      </div>
+        <div className="flex items-center gap-3 text-xs text-slate-500">
+          <span className="font-mono-zara tracking-normal normal-case">{timer}</span>
+          {info?.candidate_name && <span className="hidden sm:inline">{info.candidate_name}</span>}
+        </div>
+      </header>
 
-      <div className="mx-auto mt-8 grid w-full max-w-3xl gap-4">
-        <p className="text-center text-sm uppercase tracking-[0.2em] text-[var(--muted)]">
-          {interviewer} · {info?.role || "Technical interview"}
-          {info?.candidate_name ? ` · ${info.candidate_name}` : ""}
-        </p>
+      <main className="relative mx-auto flex min-h-[calc(100svh-64px)] max-w-6xl flex-col items-center justify-center px-5 py-8">
+        <div className="mb-8 flex w-full max-w-3xl items-center justify-between">
+          <div>
+            <p className="font-mono-zara text-[10px] text-slate-500">Question {qIndex} of 8</p>
+            <div className="mt-3 h-1 w-48 overflow-hidden rounded-full bg-white/10 sm:w-72">
+              <div className="h-full rounded-full bg-blue-400 transition-all" style={{ width: `${progressPct}%` }} />
+            </div>
+          </div>
+          <span className={`status-pill ${statusClass}`}>{statusLabel}</span>
+        </div>
 
-        <div className="flex flex-col items-center gap-4">
-          <VoiceOrb
-            agentState={agentState}
-            interviewer={interviewer}
-            micLevel={micLevel}
-            listening={agentState === "listening"}
-          />
-          <VoiceMeter active={agentState === "listening" || micReady} level={micLevel} audible={micLevel > 0.04} />
-          <p className="text-sm text-[var(--muted)]">
+        <section className="flex flex-col items-center text-center">
+          <div className="relative">
+            <div
+              className={`absolute -inset-8 rounded-full border ${
+                agentState === "thinking" ? "border-violet-400/25" : "border-blue-400/20"
+              }`}
+            />
+            <InterviewerAvatar
+              name={interviewer}
+              size="lg"
+              pulse={agentState === "speaking" || agentState === "listening"}
+            />
+          </div>
+
+          <h1 className="mt-10 text-xl font-medium">{interviewer}</h1>
+          <p className="mt-2 text-sm text-slate-400" aria-live="polite">
+            {micHint || statusLabel}
+          </p>
+
+          <div className="mt-6 w-[min(520px,90vw)]">
+            <Waveform
+              active={agentState === "speaking" || agentState === "listening"}
+              thinking={agentState === "thinking"}
+              level={agentState === "listening" ? Math.max(0.2, micLevel) : agentState === "speaking" ? 0.55 : 0.15}
+            />
+          </div>
+
+          <div className="mt-4 min-h-16 max-w-xl text-sm leading-7 text-slate-300">
+            {(partialHeard || question) && (
+              <span className="inline-block rounded-lg border border-white/10 bg-white/[.035] px-4 py-3 text-left">
+                “{partialHeard || question}”
+              </span>
+            )}
+          </div>
+        </section>
+
+        <div className="mt-10 flex flex-col items-center gap-3">
+          <div
+            className={`relative grid size-20 place-items-center rounded-full border transition-transform ${
+              agentState === "listening"
+                ? "border-blue-400/40 bg-blue-500/15 text-blue-200 shadow-[0_0_40px_rgba(59,130,246,.15)]"
+                : "border-white/15 bg-white/[.04] text-slate-400"
+            } ${agentState === "listening" ? "mic-pulse" : ""}`}
+            aria-label="Microphone"
+          >
+            <MicIcon hot={micLevel > 0.04 || agentState === "listening"} />
+          </div>
+          <span className="text-xs text-slate-500">
             {agentState === "listening"
-              ? micLevel > 0.04
-                ? "Voice audible ✓"
-                : "Listening… speak louder if bars stay flat"
+              ? "Mic open — speak, then pause ~2s"
               : agentState === "speaking"
                 ? `${interviewer} is talking`
-                : statusLabel}
-          </p>
+                : "Please wait…"}
+          </span>
         </div>
 
-        {/* Always-visible AI caption */}
-        <section className="panel border border-[var(--line)] p-5 text-left">
-          <p className="text-xs uppercase tracking-[0.16em] text-[var(--muted)]">
-            {agentState === "speaking" ? `${interviewer} is saying` : `${interviewer} said / asked`}
-          </p>
-          <p className="mt-3 text-lg leading-relaxed text-[var(--ink)] sm:text-xl">
-            {question ||
-              (agentState === "thinking"
-                ? `${interviewer} is preparing the next question…`
-                : "Waiting for greeting…")}
-          </p>
-          {agentState === "thinking" && (
-            <p className="mt-3 text-sm text-[var(--accent)]">{interviewer} is thinking — please wait…</p>
-          )}
-        </section>
-
-        {/* Always-visible mic / your voice panel */}
-        <section
-          className="panel border p-5 text-left"
-          style={{
-            borderColor:
-              agentState === "listening"
-                ? "color-mix(in oklab, var(--accent-2) 55%, var(--line))"
-                : "var(--line)",
-          }}
-        >
-          {aiStatus && !aiStatus.ready && (
-            <p className="mb-3 text-sm text-[var(--muted)]">
-              Tip: add Groq <code>LLM_API_KEY</code> for Whisper STT + smarter follow-ups. Mic still opens automatically.
-            </p>
-          )}
-          {aiStatus?.ready && (
-            <p className="mb-3 text-sm text-[var(--ok)]">
-              Live AI: {aiStatus.provider}/{aiStatus.model} · Whisper · TTS
-            </p>
-          )}
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-xs uppercase tracking-[0.16em] text-[var(--muted)]">Your mic</p>
-            <p
-              className={`text-sm ${
-                micLevel > 0.04 || partialHeard ? "text-[var(--ok)]" : "text-[var(--muted)]"
-              }`}
-            >
-              {micHint}
-            </p>
-          </div>
-
-          <div className="mt-4 flex items-center gap-4">
-            <div
-              className={`grid h-14 w-14 shrink-0 place-items-center rounded-full border ${
-                agentState === "listening" ? "mic-pulse" : ""
-              }`}
-              style={{
-                background:
-                  micLevel > 0.04
-                    ? "color-mix(in oklab, var(--ok) 40%, transparent)"
-                    : agentState === "listening"
-                      ? "color-mix(in oklab, var(--accent-2) 25%, transparent)"
-                      : "var(--panel)",
-                borderColor: micLevel > 0.04 ? "var(--ok)" : "var(--line)",
-                transform: `scale(${1 + Math.min(0.35, micLevel * 0.5)})`,
-                transition: "transform 80ms linear",
+        {agentState === "listening" && (
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
+            <select
+              className="input max-w-xs text-sm"
+              value={micDeviceId}
+              onChange={(e) => {
+                const id = e.target.value;
+                setMicDeviceId(id);
+                void startLevelMeter(id || undefined).then(() => startListeningRef.current());
               }}
-              aria-label="Microphone activity"
             >
-              <MicIcon hot={micLevel > 0.04} />
-            </div>
-            <div className="min-w-0 flex-1">
-              <VoiceMeter active={agentState === "listening"} level={micLevel} audible={micLevel > 0.04} />
-              <p className="mt-3 min-h-[2.5rem] text-base leading-relaxed text-[var(--ink)]">
-                {agentState === "thinking" && lastAnswer
-                  ? `You said: “${lastAnswer}”`
-                  : partialHeard
-                    ? `Hearing: “${partialHeard}”`
-                    : agentState === "listening"
-                      ? "Your mic is open — speak, then pause ~2 seconds."
-                      : agentState === "speaking"
-                        ? `${interviewer} is talking… your mic opens when they finish.`
-                        : lastAnswer
-                          ? `Last answer: “${lastAnswer}”`
-                          : "Mic idle."}
-              </p>
-            </div>
+              {micDevices.length === 0 ? (
+                <option value="">Default microphone</option>
+              ) : (
+                micDevices.map((d) => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label || `Mic ${d.deviceId.slice(0, 6)}`}
+                  </option>
+                ))
+              )}
+            </select>
+            <select
+              className="input max-w-[9rem] text-sm"
+              value={voiceLang}
+              onChange={(e) => {
+                setVoiceLang(e.target.value as VoiceLang);
+                startListeningRef.current();
+              }}
+            >
+              <option value="en-IN">English (India)</option>
+              <option value="en-US">English (US)</option>
+              <option value="hi-IN">Hindi</option>
+            </select>
           </div>
-        </section>
+        )}
 
-        {/* Optional typed fallback — voice is primary */}
         <form
-          className="panel grid w-full gap-3 border border-[var(--line)] p-4 text-left"
+          className="mt-8 w-full max-w-xl"
           onSubmit={(e) => {
             e.preventDefault();
             if (!answer.trim()) return;
@@ -1258,54 +1316,79 @@ export default function CandidateInterviewPage() {
             setAnswer("");
           }}
         >
-          <p className="text-xs uppercase tracking-[0.16em] text-[var(--muted)]">Or type your answer</p>
           <textarea
             ref={answerBoxRef}
-            className="input min-h-24"
+            className="input min-h-20 text-sm"
             value={answer}
             onChange={(e) => setAnswer(e.target.value)}
-            placeholder="Only if voice fails…"
+            placeholder="Text fallback if voice fails…"
           />
-          <button className="btn btn-primary w-fit" type="submit" disabled={!answer.trim() || agentState === "thinking"}>
-            Send answer
-          </button>
+          <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+            <button
+              className="btn btn-primary"
+              type="submit"
+              disabled={!answer.trim() || agentState === "thinking"}
+            >
+              Send answer
+            </button>
+            <button type="button" className="btn btn-secondary" onClick={endInterview}>
+              End interview
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => setTranscriptOpen((v) => !v)}
+            >
+              Transcript
+            </button>
+          </div>
         </form>
 
-        <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
-          <button className="btn btn-secondary" onClick={endInterview}>
-            End interview
-          </button>
-        </div>
+        {aiStatus && !aiStatus.ready && (
+          <p className="mt-4 max-w-md text-center text-xs text-slate-500">
+            Tip: add Groq LLM_API_KEY for Whisper STT + smarter follow-ups.
+          </p>
+        )}
+      </main>
 
-        <p className="text-center text-sm text-[var(--muted)]">
-          After {interviewer} finishes, your mic opens automatically. Pause ~2s when you’re done speaking.
+      {transcriptOpen && (
+        <aside className="absolute right-4 top-20 hidden w-72 rounded-lg border border-white/10 bg-[#131720]/95 p-4 shadow-2xl backdrop-blur-sm xl:block">
+          <div className="mb-4 flex items-center justify-between">
+            <p className="text-xs font-medium">Live transcript</p>
+            <span className="font-mono-zara text-[10px] tracking-normal text-emerald-300">LIVE</span>
+          </div>
+          <div className="max-h-[60vh] space-y-4 overflow-y-auto">
+            {transcript.length === 0 ? (
+              <p className="text-xs text-slate-500">Conversation will show here…</p>
+            ) : (
+              transcript.slice(-10).map((t, i) => (
+                <div key={`${i}-${t.content.slice(0, 20)}`}>
+                  <p
+                    className={`font-mono-zara text-[10px] tracking-normal ${
+                      t.role === "interviewer" ? "text-blue-300" : "text-emerald-300"
+                    }`}
+                  >
+                    {t.role === "interviewer" ? interviewer.toUpperCase() : "YOU"}
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-slate-400">{t.content}</p>
+                </div>
+              ))
+            )}
+          </div>
+        </aside>
+      )}
+
+      {error && (
+        <p className="absolute bottom-4 left-1/2 w-[min(520px,92vw)] -translate-x-1/2 text-center text-sm text-red-300">
+          {error}
         </p>
-
-        {/* Live running transcript — always on so screen never feels blank */}
-        <section className="panel max-h-56 overflow-y-auto border border-[var(--line)] p-4 text-left text-sm">
-          <p className="mb-3 text-xs uppercase tracking-[0.16em] text-[var(--muted)]">Live transcript</p>
-          {transcript.length === 0 ? (
-            <p className="text-[var(--muted)]">Conversation will show here…</p>
-          ) : (
-            <div className="space-y-3">
-              {transcript.slice(-8).map((t, i) => (
-                <p key={`${i}-${t.content.slice(0, 24)}`} className={t.role === "interviewer" ? "" : "text-[var(--muted)]"}>
-                  <strong className="text-[var(--ink)]">{t.role === "interviewer" ? interviewer : "You"}:</strong>{" "}
-                  {t.content}
-                </p>
-              ))}
-            </div>
-          )}
-        </section>
-
-        {error && <p className="text-sm text-[var(--danger)]">{error}</p>}
-      </div>
-    </Shell>
+      )}
+    </div>
   );
 }
 
 function Brand() {
-  return <div className="font-display text-lg font-700 tracking-tight">AI Technical Recruiter</div>;
+  return <div className="font-mono-zara text-sm font-semibold tracking-[.28em]">ZARA</div>;
 }
 
 function Shell({ children }: { children: React.ReactNode }) {
@@ -1314,85 +1397,17 @@ function Shell({ children }: { children: React.ReactNode }) {
 
 function MicIcon({ hot }: { hot: boolean }) {
   return (
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden>
       <path
         d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z"
-        fill={hot ? "#2a9d8f" : "currentColor"}
+        fill={hot ? "#93c5fd" : "currentColor"}
       />
       <path
         d="M19 11a7 7 0 0 1-14 0M12 18v3"
-        stroke={hot ? "#2a9d8f" : "currentColor"}
+        stroke={hot ? "#93c5fd" : "currentColor"}
         strokeWidth="1.8"
         strokeLinecap="round"
       />
     </svg>
-  );
-}
-
-function VoiceOrb({
-  agentState,
-  interviewer,
-  micLevel,
-  listening,
-}: {
-  agentState: string;
-  interviewer: string;
-  micLevel: number;
-  listening: boolean;
-}) {
-  const scale =
-    agentState === "listening" ? 1 + Math.min(0.4, micLevel * 0.7) : agentState === "speaking" ? 1.06 : 1;
-  return (
-    <div
-      className={`relative grid h-36 w-36 place-items-center rounded-full border border-[var(--line)] ${
-        agentState === "speaking" || listening ? "mic-pulse" : ""
-      }`}
-      style={{
-        background:
-          agentState === "speaking"
-            ? "color-mix(in oklab, var(--accent) 35%, transparent)"
-            : listening
-              ? "color-mix(in oklab, var(--accent-2) 28%, transparent)"
-              : "var(--panel)",
-        transform: `scale(${scale})`,
-        transition: "transform 90ms linear, background 200ms ease",
-      }}
-    >
-      <span className="font-display text-3xl">{interviewer[0]}</span>
-    </div>
-  );
-}
-
-function VoiceMeter({
-  active,
-  level,
-  audible,
-}: {
-  active: boolean;
-  level: number;
-  audible: boolean;
-}) {
-  const bars = 16;
-  return (
-    <div className="voice-meter" aria-hidden>
-      {Array.from({ length: bars }).map((_, i) => {
-        const wave = 0.35 + 0.65 * Math.abs(Math.sin(i * 0.7 + level * 8));
-        const h = active ? Math.max(4, 6 + level * 34 * wave) : 5;
-        return (
-          <span
-            key={i}
-            className="voice-bar"
-            style={{
-              height: `${h}px`,
-              background: audible
-                ? "var(--ok)"
-                : active
-                  ? "color-mix(in oklab, var(--accent-2) 70%, var(--muted))"
-                  : "var(--line)",
-            }}
-          />
-        );
-      })}
-    </div>
   );
 }
