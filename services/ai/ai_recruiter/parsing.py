@@ -52,6 +52,12 @@ def _merge_resume_with_text(parsed: ResumeProfile, heuristic: ResumeProfile, tex
         data["projects"] = heuristic.projects
     if not parsed.summary and heuristic.summary:
         data["summary"] = heuristic.summary
+    if not parsed.claims and heuristic.claims:
+        data["claims"] = heuristic.claims
+    if not parsed.metrics and heuristic.metrics:
+        data["metrics"] = heuristic.metrics
+    if not parsed.technologies and heuristic.technologies:
+        data["technologies"] = heuristic.technologies
     data["source_evidence"] = {
         **(parsed.source_evidence or {}),
         "name_source": "resume_text",
@@ -148,18 +154,28 @@ def _heuristic_resume(text: str) -> ResumeProfile:
         "TensorFlow",
         "Next.js",
         "Node.js",
+        "pgvector",
+        "LangChain",
+        "Whisper",
     ]
     skills = [s for s in skills_known if re.search(rf"\b{re.escape(s)}\b", text, re.I)]
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     name = _extract_person_name(text)
     claims = []
     for ln in lines:
-        if re.search(r"\b(built|designed|led|implemented|production|developed|created)\b", ln, re.I):
+        if re.search(r"\b(built|designed|led|implemented|production|developed|created|scaled|reduced|improved)\b", ln, re.I):
             claims.append(ln[:200])
+    metrics = []
+    for ln in lines:
+        if re.search(r"\b\d+(\.\d+)?\s*%|\b\d+x\b|\b(latency|throughput|users|qps|ms|seconds)\b", ln, re.I):
+            metrics.append(ln[:160])
     projects = []
     for c in claims[:5]:
-        proj = re.search(r"\b([A-Z][A-Za-z0-9]+(?:OS|App|System|Platform|AI)?)\b", c)
-        projects.append({"name": proj.group(1) if proj else c[:40], "description": c})
+        proj = re.search(r"\b([A-Z][A-Za-z0-9]+(?:OS|App|System|Platform|Bot|AI)?)\b", c)
+        pname = proj.group(1) if proj else ""
+        if pname.lower() in {"built", "designed", "created", "developed", "python", "fastapi"}:
+            pname = ""
+        projects.append({"name": pname or c[:40], "description": c, "tech": [s for s in skills if s.lower() in c.lower()]})
     return ResumeProfile(
         candidate_name=name,
         email=email_m.group(0) if email_m else "",
@@ -169,6 +185,9 @@ def _heuristic_resume(text: str) -> ResumeProfile:
         experience=[{"title": "Experience", "bullets": claims[:5]}],
         projects=projects,
         achievements=claims[:3],
+        claims=claims[:8],
+        metrics=metrics[:6],
+        technologies=skills,
         source_evidence={"raw_excerpt": text[:800], "name_source": "heuristic"},
     )
 
@@ -193,11 +212,21 @@ def _heuristic_jd(text: str) -> JobProfileExtract:
         title = "AI Engineer"
     elif re.search(r"\bBackend Engineer\b", text, re.I):
         title = "Backend Engineer"
+    seniority = "mid"
+    if re.search(r"\b(senior|staff|principal)\b", text, re.I):
+        seniority = "senior"
+    elif re.search(r"\b(junior|intern|entry[- ]level|new grad|graduate)\b", text, re.I):
+        seniority = "junior"
+    elif re.search(r"\b(lead|manager)\b", text, re.I):
+        seniority = "lead"
+    years = re.search(r"(\d+)\+?\s*years?", text, re.I)
+    experience = f"{years.group(0)} experience" if years else "See JD"
     return JobProfileExtract(
         title=title,
         required_skills=required or ["Python"],
         preferred_skills=[s for s in ["Kubernetes", "Kafka"] if s.lower() in text.lower()],
-        experience="See JD",
+        experience=experience,
+        seniority=seniority,
         responsibilities=[ln.strip("-• ") for ln in text.splitlines() if ln.strip().startswith(("-", "•"))][:8],
         technical_competencies=required,
         behavioral_competencies=["Communication"],
@@ -205,7 +234,7 @@ def _heuristic_jd(text: str) -> JobProfileExtract:
 
 
 def _heuristic_match(resume: ResumeProfile, job: JobProfileExtract) -> MatchResult:
-    rskills = {s.lower(): s for s in resume.skills}
+    rskills = {s.lower(): s for s in (resume.skills + resume.technologies)}
     strong, partial, missing = [], [], []
     for skill in job.required_skills:
         key = skill.lower()
@@ -221,18 +250,31 @@ def _heuristic_match(resume: ResumeProfile, job: JobProfileExtract) -> MatchResu
             partial.append(skill)
         elif key not in rskills and skill not in missing:
             missing.append(skill)
-    claims = []
+    claims = list(resume.claims or [])
     for exp in resume.experience:
         for b in exp.get("bullets", []) if isinstance(exp, dict) else []:
-            claims.append(b)
+            if b not in claims:
+                claims.append(b)
     for p in resume.projects:
         if isinstance(p, dict) and p.get("description"):
-            claims.append(str(p["description"]))
+            desc = str(p["description"])
+            if desc not in claims:
+                claims.append(desc)
+    # Suspicious: big words without metrics/tech detail
+    suspicious = []
+    for c in claims[:8]:
+        low = c.lower()
+        big = bool(re.search(r"\b(scalable|production|enterprise|state[- ]of[- ]the[- ]art|end[- ]to[- ]end)\b", low))
+        thin = len(c.split()) < 12 or not any(s.lower() in low for s in resume.skills[:8])
+        no_metric = not re.search(r"\d", c)
+        if big and (thin or no_metric):
+            suspicious.append(c[:200])
     return MatchResult(
         strong_matches=strong,
         partial_matches=partial,
         missing=missing,
         claims_to_validate=claims[:5],
+        suspicious_claims=suspicious[:4],
         relevant_projects=[str(p.get("name", p)) for p in resume.projects[:5] if isinstance(p, dict)],
-        potential_interview_areas=(missing + strong)[:8],
+        potential_interview_areas=(suspicious + missing + strong)[:8],
     )

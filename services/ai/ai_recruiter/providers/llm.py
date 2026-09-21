@@ -138,7 +138,13 @@ class MockLLM(LLMProvider):
                     }
                 )
             return json.dumps({"intent": "CLARIFICATION", "reply": "I mean your practical approach and trade-offs."})
-        if "question" in prompt_name or "generate a technical interview question" in blob or "generate one interview question" in blob:
+        if (
+            "question" in prompt_name
+            or "generate a technical interview question" in blob
+            or "generate one interview question" in blob
+            or "last answer:" in blob
+            or "full resume:" in blob
+        ):
             # Try to ground in resume projects / skills from the prompt itself
             project = None
             for marker in ("creatoros", "built ", "project"):

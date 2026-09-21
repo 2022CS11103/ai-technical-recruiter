@@ -16,6 +16,9 @@ class ResumeProfile(BaseModel):
     projects: list[dict[str, Any]] = Field(default_factory=list)
     certifications: list[str] = Field(default_factory=list)
     achievements: list[str] = Field(default_factory=list)
+    claims: list[str] = Field(default_factory=list)
+    metrics: list[str] = Field(default_factory=list)
+    technologies: list[str] = Field(default_factory=list)
     source_evidence: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -24,6 +27,7 @@ class JobProfileExtract(BaseModel):
     required_skills: list[str] = Field(default_factory=list)
     preferred_skills: list[str] = Field(default_factory=list)
     experience: str = ""
+    seniority: str = ""
     responsibilities: list[str] = Field(default_factory=list)
     technical_competencies: list[str] = Field(default_factory=list)
     behavioral_competencies: list[str] = Field(default_factory=list)
@@ -34,6 +38,7 @@ class MatchResult(BaseModel):
     partial_matches: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
     claims_to_validate: list[str] = Field(default_factory=list)
+    suspicious_claims: list[str] = Field(default_factory=list)
     relevant_projects: list[str] = Field(default_factory=list)
     potential_interview_areas: list[str] = Field(default_factory=list)
 
@@ -46,6 +51,13 @@ class InterviewPlan(BaseModel):
     difficulty_strategy: str = "adaptive"
     mandatory_questions: list[str] = Field(default_factory=list)
     resume_claims_to_validate: list[str] = Field(default_factory=list)
+    competencies: list[dict[str, Any]] = Field(default_factory=list)
+    claims: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    projects: list[str] = Field(default_factory=list)
+    suspicious_claims: list[str] = Field(default_factory=list)
+    seniority: str = ""
+    candidate_profile: dict[str, Any] = Field(default_factory=dict)
 
 
 class GeneratedQuestion(BaseModel):
@@ -74,6 +86,11 @@ class EvaluationResult(BaseModel):
     missing_points: list[str] = Field(default_factory=list)
     confidence: float = 0.0
     status: str = "scored"
+    quote: str = ""
+    probe_hint: str = ""
+    score_0_to_5: float = 0.0
+    answer_quality: Literal["weak", "ok", "strong", "incorrect", "unclear"] = "ok"
+    enough_evidence: bool = False
 
 
 class GuardrailResult(BaseModel):
@@ -130,3 +147,18 @@ class InterviewState(BaseModel):
     plan: dict[str, Any] = Field(default_factory=dict)
     claims_status: dict[str, str] = Field(default_factory=dict)
     pending_mandatory: list[str] = Field(default_factory=list)
+    probe_level: int = 0
+    current_claim: str = ""
+    current_project: str = ""
+    competency_queue: list[str] = Field(default_factory=list)
+    evidence_log: list[dict[str, Any]] = Field(default_factory=list)
+    competency_evidence: dict[str, list[str]] = Field(default_factory=dict)
+    # Structured state — not chat history alone
+    asked_questions: list[str] = Field(default_factory=list)
+    asked_topic_keys: list[str] = Field(default_factory=list)
+    evidence_counts: dict[str, int] = Field(default_factory=dict)
+    memory_summary: str = ""
+    candidate_profile: dict[str, Any] = Field(default_factory=dict)
+    last_action: str = ""
+    consecutive_strong: int = 0
+    consecutive_weak: int = 0

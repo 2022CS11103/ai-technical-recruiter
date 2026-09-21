@@ -41,6 +41,18 @@ async def require_recruiter(user: Annotated[User, Depends(get_current_user)]) ->
     return user
 
 
+async def require_candidate(user: Annotated[User, Depends(get_current_user)]) -> User:
+    if user.role not in (UserRole.candidate, UserRole.admin):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Candidate access required")
+    return user
+
+
+async def require_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
+    if user.role != UserRole.admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return user
+
+
 async def get_user_company_id(user: User, db: AsyncSession) -> uuid.UUID:
     if not user.memberships:
         result = await db.execute(select(CompanyMembership).where(CompanyMembership.user_id == user.id).limit(1))

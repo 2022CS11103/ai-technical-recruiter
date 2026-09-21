@@ -55,13 +55,19 @@ export default function LandingPage() {
             follow-ups and returns evidence recruiters can trust.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
-            <Link href="/register" className="btn btn-primary">
-              Create Interview
+            <Link href="/login" className="btn btn-primary">
+              Recruiter workspace
+            </Link>
+            <Link href="/register" className="btn btn-secondary">
+              Candidate portal
             </Link>
             <Link href="/interview/try" className="btn btn-secondary">
-              Try Candidate Interview
+              Try voice interview
             </Link>
           </div>
+          <p className="mt-4 text-xs text-[var(--muted)]">
+            Demo: recruiter@example.com · candidate@example.com · admin@example.com — password demo1234
+          </p>
         </div>
 
         <div className="relative">

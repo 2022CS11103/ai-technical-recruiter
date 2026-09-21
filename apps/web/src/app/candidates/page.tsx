@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Filter, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -8,22 +8,62 @@ import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/app/PageHeader";
 import { StatusBadge } from "@/components/app/StatusBadge";
 import { AppShell } from "@/components/app/AppShell";
-import { candidates } from "@/data/mockData";
+import { api } from "@/lib/api";
+
+type LiveCandidate = {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  score: number | null;
+  status: string;
+  recommendation: string;
+  date: string;
+};
+
+function initials(name: string) {
+  return name
+    .split(" ")
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join("") || "C";
+}
 
 export default function CandidatesPage() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("All");
+  const [rows, setRows] = useState<LiveCandidate[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    api<LiveCandidate[]>("/api/v1/dossiers/recent", { auth: false })
+      .then((data) => {
+        if (!cancelled) setRows(Array.isArray(data) ? data : []);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : "Could not load dossiers");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const filtered = useMemo(
     () =>
-      candidates.filter(
+      rows.filter(
         (candidate) =>
           (filter === "All" || candidate.status === filter) &&
           `${candidate.name} ${candidate.role} ${candidate.email}`
             .toLowerCase()
             .includes(search.toLowerCase())
       ),
-    [search, filter]
+    [rows, search, filter]
   );
 
   return (
@@ -31,7 +71,7 @@ export default function CandidatesPage() {
       <div className="mx-auto max-w-[1500px] p-5 sm:p-8" data-testid="candidates-page">
         <PageHeader
           title="Candidates"
-          description="Review every interview through one structured evaluation layer."
+          description="Evidence collected from live ZARA interviews — not sample data."
           action={
             <Button
               variant="outline"
@@ -57,7 +97,7 @@ export default function CandidatesPage() {
             />
           </div>
           <div className="flex gap-1 overflow-x-auto rounded-md bg-muted/40 p-1">
-            {["All", "Completed", "In Progress", "Invited"].map((item) => (
+            {["All", "Completed", "In Progress"].map((item) => (
               <button
                 key={item}
                 onClick={() => setFilter(item)}
@@ -98,15 +138,13 @@ export default function CandidatesPage() {
                         className="flex items-center gap-3"
                         data-testid={`candidate-profile-link-${candidate.id}`}
                       >
-                        <img
-                          src={candidate.avatar}
-                          alt={`${candidate.name} avatar`}
-                          className="size-9 rounded-full object-cover"
-                        />
+                        <span className="grid size-9 place-items-center rounded-full bg-blue-500/15 text-xs font-medium text-blue-200">
+                          {initials(candidate.name)}
+                        </span>
                         <span>
                           <span className="block text-sm font-medium">{candidate.name}</span>
                           <span className="block text-xs text-muted-foreground">
-                            {candidate.email}
+                            {candidate.email || "No email on resume"}
                           </span>
                         </span>
                       </Link>
@@ -121,7 +159,9 @@ export default function CandidatesPage() {
                       <StatusBadge status={candidate.status} />
                     </td>
                     <td className="px-5 py-4 text-sm text-muted-foreground">
-                      {candidate.score ? candidate.recommendation : "Awaiting interview"}
+                      {candidate.status === "Completed"
+                        ? candidate.recommendation
+                        : "Awaiting interview"}
                     </td>
                     <td className="px-5 py-4 text-xs text-muted-foreground">
                       {candidate.date}
@@ -131,12 +171,26 @@ export default function CandidatesPage() {
               </tbody>
             </table>
           </div>
-          {filtered.length === 0 && (
+          {loading && (
+            <div className="p-12 text-center text-sm text-muted-foreground">
+              Loading live dossiers…
+            </div>
+          )}
+          {!loading && error && (
+            <div className="p-12 text-center text-sm text-muted-foreground" data-testid="candidates-empty-state">
+              {error}
+            </div>
+          )}
+          {!loading && !error && filtered.length === 0 && (
             <div
               className="p-12 text-center text-sm text-muted-foreground"
               data-testid="candidates-empty-state"
             >
-              No candidates match this view.
+              No live interviews yet.{" "}
+              <Link href="/interview/try" className="text-blue-300 hover:text-blue-200">
+                Run a ZARA interview
+              </Link>{" "}
+              and the evidence dossier will appear here.
             </div>
           )}
         </div>

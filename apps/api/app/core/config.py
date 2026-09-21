@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     demo_email: str = "recruiter@example.com"
     demo_password: str = "demo1234"
     demo_name: str = "Demo Recruiter"
+    max_concurrent_interviews: int = 5
 
     @model_validator(mode="after")
     def fill_keys_from_aliases(self):

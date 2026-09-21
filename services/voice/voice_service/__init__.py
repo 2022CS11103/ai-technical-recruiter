@@ -33,8 +33,18 @@ class GroqSTT(STTProvider):
         from groq import AsyncGroq
 
         client = AsyncGroq(api_key=self.api_key)
+        ext = "webm"
+        lower = (mime_type or "").lower()
+        if "mp4" in lower or "m4a" in lower:
+            ext = "mp4"
+        elif "wav" in lower:
+            ext = "wav"
+        elif "mpeg" in lower or "mp3" in lower:
+            ext = "mp3"
+        elif "ogg" in lower:
+            ext = "ogg"
         file_obj = io.BytesIO(audio_bytes)
-        file_obj.name = "audio.webm"
+        file_obj.name = f"answer.{ext}"
         result = await client.audio.transcriptions.create(
             file=file_obj,
             model=self.model,

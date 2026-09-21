@@ -6,16 +6,17 @@ import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ai_recruiter.planner import clean_topic_name
 from ai_recruiter.schemas import InterviewState
 
 from app.core.deps import get_user_company_id, require_recruiter
 from app.core.redis_client import get_redis
-from app.core.security import generate_interview_token, hash_token
+from app.core.security import generate_interview_token, hash_token, safe_decode_token
 from app.db.session import AsyncSessionLocal, get_db
 from app.models import (
     Answer,
@@ -141,34 +142,130 @@ async def _load_context(db: AsyncSession, session: InterviewSession) -> dict[str
             "partial_matches": match.partial_matches if match else [],
             "missing": match.missing if match else [],
             "claims_to_validate": match.claims_to_validate if match else [],
+            "suspicious_claims": ((match.raw or {}).get("suspicious_claims") if match else []) or [],
             "relevant_projects": match.relevant_projects if match else [],
+            "potential_interview_areas": match.potential_interview_areas if match else [],
         }
         if match
         else {},
-        "resume_text": (resume_text[:4000] if resume_text else ""),
+        "resume_text": (resume_text[:8000] if resume_text else ""),
         "resume_projects": projects,
         "resume_skills": skills,
         "resume_experience": experience,
+        "resume_claims": (
+            ((profile.raw_extraction or {}).get("claims") if profile else None)
+            or (profile.achievements if profile else [])
+            or (match.claims_to_validate if match else [])
+            or []
+        ),
+        "resume_metrics": ((profile.raw_extraction or {}).get("metrics") if profile else []) or [],
+        "resume_technologies": (
+            ((profile.raw_extraction or {}).get("technologies") if profile else None) or skills
+        ),
+        "resume_summary": (profile.summary if profile else "") or "",
+        "candidate_profile": {
+            "name": candidate_name,
+            "skills": skills,
+            "technologies": ((profile.raw_extraction or {}).get("technologies") if profile else None) or skills,
+            "projects": projects,
+            "experience": experience,
+            "claims": (
+                ((profile.raw_extraction or {}).get("claims") if profile else None)
+                or (profile.achievements if profile else [])
+                or []
+            ),
+            "metrics": ((profile.raw_extraction or {}).get("metrics") if profile else []) or [],
+            "summary": (profile.summary if profile else "") or "",
+        },
+        "jd_text": ((job.raw_jd_text or "")[:3000] if job else ""),
         "jd_required_skills": (job_profile.required_skills if job_profile else []) or [],
+        "jd_preferred_skills": (job_profile.preferred_skills if job_profile else []) or [],
         "jd_responsibilities": (job_profile.responsibilities if job_profile else []) or [],
+        "jd_experience": (job_profile.experience if job_profile else "") or "",
+        "seniority": ((job_profile.raw_extraction or {}).get("seniority") if job_profile else "") or "",
+        "interview_plan": session.plan or {},
     }
 
 
 async def _speak(text: str, interviewer_name: str | None = None) -> str | None:
-    """Synthesize speech — edge-tts; fail soft so interview never hangs."""
+    """Optional server TTS. Keep this tiny — Next.js proxy dies if /answer waits on edge-tts.
+
+    The candidate room speaks with the browser Web Speech API immediately when `reply` arrives.
+    """
     if not text or not text.strip():
         return None
     try:
         audio = await asyncio.wait_for(
             get_tts_for_interviewer(interviewer_name).synthesize(text),
-            timeout=12.0,
+            timeout=2.0,
         )
         if audio:
             return base64.b64encode(audio).decode("ascii")
     except Exception as exc:
-        print(f"[tts] failed: {exc}", flush=True)
+        print(f"[tts] skipped: {exc}", flush=True)
         return None
     return None
+
+
+def _topic_context(state: InterviewState) -> dict[str, Any]:
+    """UI label so candidates know which project/internship a question is about."""
+    section = (state.current_section or "").lower()
+    project = (state.current_project or "").strip()
+    claim = (state.current_claim or "").strip()
+    competency = (state.current_competency or "").strip()
+    # Fallback: pull from the planned competency if state fields were not synced yet.
+    if not project or not claim:
+        for item in state.plan.get("competencies") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name") or "").lower() != competency.lower():
+                continue
+            if not project:
+                project = clean_topic_name(str(item.get("project") or "")) or project
+            if not claim:
+                claim = str(item.get("claim") or "").strip() or claim
+            break
+    label = None
+    kind = "general"
+
+    def _looks_internship(text: str) -> bool:
+        low = text.lower()
+        return any(w in low for w in ("intern", "internship", "trainee", "apprentice"))
+
+    if section in {"introduction", "end", "closing", "wrap_up", "wrap-up"}:
+        kind = "general"
+        label = None
+    elif project:
+        if _looks_internship(project):
+            kind = "internship"
+            label = f"Internship: {project[:72]}"
+        else:
+            kind = "project"
+            label = f"Project: {project}"
+    elif claim:
+        if _looks_internship(claim):
+            kind = "internship"
+            label = f"Internship: {claim[:72]}"
+        else:
+            kind = "claim"
+            label = f"From your resume: {claim[:72]}"
+    elif competency and competency.lower() not in {
+        "resume",
+        "general",
+        "communication",
+        "introduction",
+        "closing",
+    }:
+        kind = "topic"
+        label = f"Topic: {competency}"
+    return {
+        "kind": kind,
+        "label": label,
+        "project": project or None,
+        "claim": claim or None,
+        "competency": competency or None,
+        "section": section or None,
+    }
 
 
 async def _persist_state(db: AsyncSession, session: InterviewSession, state: InterviewState) -> None:
@@ -360,7 +457,11 @@ async def extract_document_public(file: UploadFile = File(...)):
 
 
 @router.post("/interview-links/self-serve")
-async def self_serve_interview(payload: dict[str, Any], db: Annotated[AsyncSession, Depends(get_db)]):
+async def self_serve_interview(
+    payload: dict[str, Any],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    authorization: Annotated[Optional[str], Header()] = None,
+):
     """Candidate opens interview by pasting JD + resume. No recruiter login required."""
     from ai_recruiter import analyze_jd, match_resume_jd, parse_resume
     from app.services.ai_factory import get_llm
@@ -393,6 +494,40 @@ async def self_serve_interview(payload: dict[str, Any], db: Annotated[AsyncSessi
         resume.candidate_name = extracted_name or "Candidate"
 
     match = await match_resume_jd(llm, resume, jd)
+
+    plan_context = {
+        "job_title": jd.title or payload.get("job_title") or "Technical Role",
+        "duration_minutes": duration,
+        "difficulty": "adaptive",
+        "competencies": {name: 1 for name in (jd.technical_competencies or jd.required_skills or [])},
+        "jd_required_skills": jd.required_skills,
+        "jd_preferred_skills": jd.preferred_skills,
+        "jd_responsibilities": jd.responsibilities,
+        "jd_experience": jd.experience,
+        "seniority": jd.seniority,
+        "resume_skills": resume.skills,
+        "resume_projects": resume.projects,
+        "resume_experience": resume.experience,
+        "resume_claims": resume.claims,
+        "resume_metrics": resume.metrics,
+        "resume_technologies": resume.technologies,
+        "resume_summary": resume.summary,
+        "candidate_name": resume.candidate_name,
+        "candidate_profile": {
+            "name": resume.candidate_name,
+            "skills": resume.skills,
+            "technologies": resume.technologies or resume.skills,
+            "projects": resume.projects,
+            "experience": resume.experience,
+            "claims": resume.claims,
+            "metrics": resume.metrics,
+            "summary": resume.summary,
+        },
+        "match": match.model_dump(),
+    }
+    from ai_recruiter.planner import build_interview_plan
+
+    interview_plan = await build_interview_plan(llm, plan_context)
 
     job = Job(
         company_id=company.id,
@@ -435,14 +570,52 @@ async def self_serve_interview(payload: dict[str, Any], db: Annotated[AsyncSessi
     )
     db.add(cand)
     await db.flush()
-    db.add(CandidateProfile(candidate_id=cand.id, **resume.model_dump()))
+    if authorization and authorization.lower().startswith("bearer "):
+        decoded = safe_decode_token(authorization.split(" ", 1)[1])
+        if decoded and decoded.get("sub"):
+            try:
+                logged = await db.get(User, uuid.UUID(str(decoded["sub"])))
+            except ValueError:
+                logged = None
+            if logged and logged.is_active:
+                cand.user_id = logged.id
+                if logged.email:
+                    cand.email = logged.email
+    db.add(
+        CandidateProfile(
+            candidate_id=cand.id,
+            candidate_name=resume.candidate_name or "",
+            email=resume.email or "",
+            phone=resume.phone or "",
+            summary=resume.summary or "",
+            skills=resume.skills or [],
+            experience=resume.experience or [],
+            education=resume.education or [],
+            projects=resume.projects or [],
+            certifications=resume.certifications or [],
+            achievements=(resume.achievements or resume.claims or [])[:10],
+            source_evidence=resume.source_evidence or {},
+            raw_extraction={
+                **resume.model_dump(),
+                "claims": resume.claims,
+                "metrics": resume.metrics,
+                "technologies": resume.technologies,
+            },
+        )
+    )
+    match_payload = match.model_dump()
     db.add(
         ResumeJdMatch(
             company_id=company.id,
             job_id=job.id,
             candidate_id=cand.id,
-            **match.model_dump(),
-            raw=match.model_dump(),
+            strong_matches=match.strong_matches,
+            partial_matches=match.partial_matches,
+            missing=match.missing,
+            claims_to_validate=match.claims_to_validate,
+            relevant_projects=match.relevant_projects,
+            potential_interview_areas=match.potential_interview_areas,
+            raw=match_payload,
         )
     )
 
@@ -454,7 +627,10 @@ async def self_serve_interview(payload: dict[str, Any], db: Annotated[AsyncSessi
         status=InterviewStatus.scheduled,
         token_hash=hash_token(token),
         duration_minutes=duration,
-        plan={"interviewer_name": interviewer_name},
+        plan={
+            **interview_plan.model_dump(),
+            "interviewer_name": interviewer_name,
+        },
         consent_snapshot={
             "consent": True,
             "ai_disclosure": True,
@@ -464,6 +640,19 @@ async def self_serve_interview(payload: dict[str, Any], db: Annotated[AsyncSessi
         },
     )
     db.add(session)
+    try:
+        from app.services.rag_index import index_interview_corpus
+
+        await index_interview_corpus(
+            db,
+            company_id=company.id,
+            job_id=job.id,
+            candidate_id=cand.id,
+            jd_text=jd_text,
+            resume_text=resume_text,
+        )
+    except Exception as exc:
+        print(f"[rag] ingest skipped: {exc}", flush=True)
     await db.commit()
     return {
         "token": token,
@@ -473,7 +662,20 @@ async def self_serve_interview(payload: dict[str, Any], db: Annotated[AsyncSessi
         "candidate_name": cand.full_name,
         "duration_minutes": duration,
         "match": match.model_dump(),
+        "candidate_id": str(cand.id),
+        "plan": {
+            "competencies": interview_plan.competencies,
+            "claims": interview_plan.claims,
+            "gaps": interview_plan.gaps,
+        },
     }
+
+
+@router.get("/interview-links/capacity")
+async def interview_capacity(db: Annotated[AsyncSession, Depends(get_db)]):
+    from app.services.capacity import capacity_snapshot
+
+    return await capacity_snapshot(db)
 
 
 @router.get("/interview-links/{token}")
@@ -487,6 +689,7 @@ async def interview_link_info(token: str, db: Annotated[AsyncSession, Depends(ge
         "status": session.status.value,
         "role": job.title if job else "",
         "candidate_name": cand.full_name if cand else "",
+        "candidate_id": str(session.candidate_id),
         "duration_minutes": session.duration_minutes,
         "allow_pause": job.allow_pause if job else True,
         "consent_required": True,
@@ -545,11 +748,10 @@ async def _start_session(session: InterviewSession, db: AsyncSession) -> dict[st
             state = await _get_state(db, session)
             reply = state.last_question or (state.conversation_history[-1]["content"] if state.conversation_history else "")
             if reply:
-                audio_b64 = await _speak(reply, context.get("interviewer_name", "Sarah"))
                 return {
                     "reply": reply,
                     "state": state.model_dump(),
-                    "audio_base64": audio_b64,
+                    "audio_base64": None,
                     "interviewer_name": context.get("interviewer_name", "Sarah"),
                     "candidate_name": context.get("candidate_name", ""),
                     "already_started": True,
@@ -571,6 +773,14 @@ async def _start_session(session: InterviewSession, db: AsyncSession) -> dict[st
     session.status = InterviewStatus.in_progress
     session.started_at = datetime.now(timezone.utc)
     session.plan = {**(session.plan or {}), **(state.plan or {}), "interviewer_name": context.get("interviewer_name", "Sarah")}
+    db.add(
+        AuditLog(
+            company_id=session.company_id,
+            action="interview_started",
+            resource_type="interview",
+            resource_id=str(session.id),
+        )
+    )
     await _persist_state(db, session, state)
     q = InterviewQuestion(
         session_id=session.id,
@@ -582,13 +792,13 @@ async def _start_session(session: InterviewSession, db: AsyncSession) -> dict[st
     )
     db.add(q)
     await db.commit()
-    audio_b64 = await _speak(reply, context.get("interviewer_name", "Sarah"))
     return {
         "reply": reply,
         "state": state.model_dump(),
-        "audio_base64": audio_b64,
+        "audio_base64": None,
         "interviewer_name": context.get("interviewer_name", "Sarah"),
         "candidate_name": context.get("candidate_name", ""),
+        "topic": _topic_context(state),
     }
 
 
@@ -678,18 +888,24 @@ async def _answer(session: InterviewSession, answer_text: str, db: AsyncSession)
         await _persist_state(db, session, state)
         finished = await _finish(session, db, state)
         finished["reply"] = reply
-        finished["audio_base64"] = await _speak(
-            reply or "Thanks for your time today. That wraps up the interview.",
-            context.get("interviewer_name", "Sarah"),
-        )
+        finished["audio_base64"] = None
         return finished
 
     # Meta turns (repeat / wait / clarify) should not create a new scored question row.
-    if meta.get("action") in {"REPEAT", "WAIT", "CLARIFY", "CLARIFY_SCOPE", "REDIRECT", "COMPANY_QA", "PAUSED"}:
+    if meta.get("action") in {
+        "REPEAT",
+        "WAIT",
+        "CLARIFY",
+        "CLARIFY_SCOPE",
+        "REDIRECT",
+        "COMPANY_QA",
+        "PAUSED",
+        "PARAPHRASE",
+        "AWAIT_ANSWER",
+    }:
         await _persist_state(db, session, state)
         await db.commit()
-        audio_b64 = await _speak(spoken, context.get("interviewer_name", "Sarah"))
-        return {"reply": spoken, "meta": meta, "state": state.model_dump(), "audio_base64": audio_b64}
+        return {"reply": spoken, "meta": meta, "state": state.model_dump(), "audio_base64": None, "topic": _topic_context(state)}
 
     q = InterviewQuestion(
         session_id=session.id,
@@ -704,8 +920,7 @@ async def _answer(session: InterviewSession, answer_text: str, db: AsyncSession)
     db.add(q)
     await _persist_state(db, session, state)
     await db.commit()
-    audio_b64 = await _speak(spoken, context.get("interviewer_name", "Sarah"))
-    return {"reply": spoken, "meta": meta, "state": state.model_dump(), "audio_base64": audio_b64}
+    return {"reply": spoken, "meta": meta, "state": state.model_dump(), "audio_base64": None, "topic": _topic_context(state)}
 
 
 async def _interrupt_session(session: InterviewSession, db: AsyncSession) -> dict[str, Any]:
@@ -818,7 +1033,9 @@ async def _finish(session: InterviewSession, db: AsyncSession, state: InterviewS
     report = await agent.finish(state, context)
     session.status = InterviewStatus.completed
     session.ended_at = datetime.now(timezone.utc)
+    evidence_map = state.competency_evidence or {}
     for name, score in (report.competency_scores or state.competency_scores).items():
+        quotes = evidence_map.get(name) or []
         existing = (
             await db.execute(
                 select(CompetencyScore).where(
@@ -828,8 +1045,16 @@ async def _finish(session: InterviewSession, db: AsyncSession, state: InterviewS
         ).scalar_one_or_none()
         if existing:
             existing.score_0_to_100 = float(score)
+            existing.evidence = quotes
         else:
-            db.add(CompetencyScore(session_id=session.id, competency=name, score_0_to_100=float(score)))
+            db.add(
+                CompetencyScore(
+                    session_id=session.id,
+                    competency=name,
+                    score_0_to_100=float(score),
+                    evidence=quotes,
+                )
+            )
     existing_report = (
         await db.execute(select(InterviewReport).where(InterviewReport.session_id == session.id))
     ).scalar_one_or_none()
@@ -863,7 +1088,135 @@ async def _finish(session: InterviewSession, db: AsyncSession, state: InterviewS
         report_id = row.id
     await _persist_state(db, session, state)
     await db.commit()
-    return {"status": "completed", "report_id": str(report_id), "report": report.model_dump()}
+    return {
+        "status": "completed",
+        "report_id": str(report_id),
+        "report": report.model_dump(),
+        "candidate_id": str(session.candidate_id),
+        "session_id": str(session.id),
+    }
+
+
+async def _build_dossier(db: AsyncSession, session: InterviewSession) -> dict[str, Any]:
+    cand = await db.get(Candidate, session.candidate_id)
+    job = await db.get(Job, session.job_id)
+    report = (
+        await db.execute(select(InterviewReport).where(InterviewReport.session_id == session.id))
+    ).scalar_one_or_none()
+    state_row = (
+        await db.execute(select(InterviewStateRow).where(InterviewStateRow.session_id == session.id))
+    ).scalar_one_or_none()
+    questions = (
+        await db.execute(
+            select(InterviewQuestion)
+            .options(selectinload(InterviewQuestion.answers).selectinload(Answer.evaluation))
+            .where(InterviewQuestion.session_id == session.id)
+            .order_by(InterviewQuestion.sequence)
+        )
+    ).scalars().all()
+    scores = (
+        await db.execute(select(CompetencyScore).where(CompetencyScore.session_id == session.id))
+    ).scalars().all()
+    state = (state_row.state or {}) if state_row else {}
+    plan = session.plan or {}
+    evaluations = []
+    for q in questions:
+        for a in q.answers:
+            evaluations.append(
+                {
+                    "question": q.question_text,
+                    "answer": a.answer_text,
+                    "competency": q.competency,
+                    "score": (a.evaluation.raw or {}).get("score_0_to_5") if a.evaluation else None,
+                    "evaluation": (a.evaluation.raw or {}).get("probe_hint") if a.evaluation else "",
+                    "evidence": a.evaluation.evidence if a.evaluation else [],
+                    "missing_points": a.evaluation.missing_points if a.evaluation else [],
+                    "status": a.evaluation.status if a.evaluation else "",
+                }
+            )
+    rec = report.recommendation.value if report else "insufficient_evidence"
+    rec_label = {
+        "strong_yes": "Strong Hire",
+        "yes": "Hire",
+        "maybe": "Consider",
+        "no": "No Hire",
+        "insufficient_evidence": "Insufficient evidence",
+    }.get(rec, rec)
+    score_map = {row.competency: row.score_0_to_100 for row in scores} or (state.get("competency_scores") or {})
+    evidence_map = state.get("competency_evidence") or {}
+    if not evidence_map:
+        evidence_map = {row.competency: (row.evidence or []) for row in scores if row.evidence}
+    return {
+        "candidate_id": str(session.candidate_id),
+        "session_id": str(session.id),
+        "status": session.status.value,
+        "name": cand.full_name if cand else "Candidate",
+        "email": cand.email if cand else "",
+        "role": job.title if job else "",
+        "date": session.created_at.strftime("%b %d, %Y") if session.created_at else "",
+        "plan": {
+            "competencies": plan.get("competencies") or [],
+            "claims": plan.get("claims") or plan.get("resume_claims_to_validate") or [],
+            "gaps": plan.get("gaps") or [],
+        },
+        "overall_score": report.overall_score if report else 0,
+        "recommendation": rec_label,
+        "strengths": report.strengths if report else [],
+        "weaknesses": report.weaknesses if report else [],
+        "evidence": report.evidence if report else [],
+        "resume_validation": report.resume_validation if report else [],
+        "technical_gaps": report.technical_gaps if report else [],
+        "recommended_next_step": report.recommended_next_step if report else "",
+        "competency_scores": score_map,
+        "competency_evidence": evidence_map,
+        "evidence_log": state.get("evidence_log") or [],
+        "evaluations": evaluations,
+        "conversation_history": state.get("conversation_history") or [],
+        "report_id": str(report.id) if report else None,
+    }
+
+
+@router.get("/dossiers/recent")
+async def list_recent_dossiers(db: Annotated[AsyncSession, Depends(get_db)]):
+    """Live sessions for the recruiter UI (includes self-serve interviews)."""
+    sessions = (
+        await db.execute(select(InterviewSession).order_by(InterviewSession.created_at.desc()).limit(30))
+    ).scalars().all()
+    rows = []
+    for session in sessions:
+        dossier = await _build_dossier(db, session)
+        rows.append(
+            {
+                "id": dossier["candidate_id"],
+                "name": dossier["name"],
+                "email": dossier["email"],
+                "role": dossier["role"],
+                "score": round((dossier["overall_score"] or 0) / 10, 1) if dossier["overall_score"] else None,
+                "status": "Completed" if session.status == InterviewStatus.completed else "In Progress",
+                "recommendation": dossier["recommendation"],
+                "date": session.created_at.strftime("%b %d, %Y") if session.created_at else "",
+            }
+        )
+    return rows
+
+
+@router.get("/dossiers/{candidate_id}")
+async def get_dossier(candidate_id: uuid.UUID, db: Annotated[AsyncSession, Depends(get_db)]):
+    session = (
+        await db.execute(
+            select(InterviewSession)
+            .where(InterviewSession.candidate_id == candidate_id)
+            .order_by(InterviewSession.created_at.desc())
+        )
+    ).scalars().first()
+    if not session:
+        raise HTTPException(status_code=404, detail="No interview found for this candidate")
+    return await _build_dossier(db, session)
+
+
+@router.get("/interview-links/{token}/dossier")
+async def dossier_by_token(token: str, db: Annotated[AsyncSession, Depends(get_db)]):
+    return await _build_dossier(db, await _session_by_token(db, token))
 
 
 async def _resolve(db: AsyncSession, token: Optional[str], interview_id: Optional[uuid.UUID]) -> InterviewSession:
@@ -1006,7 +1359,13 @@ async def stt_endpoint(token: str, file: UploadFile = File(...), db: AsyncSessio
             "hint": "Set LLM_API_KEY or STT_API_KEY in apps/api/.env (Groq key) and restart the API",
         }
     try:
-        text = await get_stt().transcribe(data, file.content_type or "audio/webm")
+        name = (file.filename or "").lower()
+        mime = file.content_type or ""
+        if name.endswith(".wav") or "wav" in mime:
+            mime = "audio/wav"
+        elif name.endswith(".mp4") or "mp4" in mime:
+            mime = "audio/mp4"
+        text = await get_stt().transcribe(data, mime or "audio/webm")
     except Exception as exc:
         print(f"[stt] failed: {exc}", flush=True)
         return {"text": "", "error": "stt_failed"}

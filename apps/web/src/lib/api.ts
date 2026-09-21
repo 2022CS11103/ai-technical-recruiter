@@ -19,6 +19,22 @@ export function setToken(token: string) {
 
 export function clearToken() {
   localStorage.removeItem("atr_token");
+  localStorage.removeItem("atr_role");
+}
+
+export function setRole(role: string) {
+  localStorage.setItem("atr_role", role);
+}
+
+export function getRole(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("atr_role");
+}
+
+export function homeForRole(role?: string | null) {
+  if (role === "admin") return "/admin";
+  if (role === "candidate") return "/portal";
+  return "/dashboard";
 }
 
 export async function api<T = unknown>(

@@ -8,6 +8,7 @@ from pydantic import BaseModel, EmailStr, Field
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    role: str = "recruiter"
 
 
 class UserOut(BaseModel):
@@ -23,6 +24,7 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8)
     full_name: str
     company_name: str = "My Company"
+    role: str = "recruiter"
 
 
 class LoginRequest(BaseModel):

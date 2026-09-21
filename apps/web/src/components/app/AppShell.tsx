@@ -5,10 +5,12 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import {
   BarChart3,
+  BookOpen,
   BriefcaseBusiness,
   ChevronLeft,
   ChevronRight,
   ClipboardList,
+  FileBarChart,
   LayoutDashboard,
   Menu,
   PanelLeftClose,
@@ -21,10 +23,12 @@ import { clearToken } from "@/lib/api";
 
 const nav = [
   { label: "Overview", href: "/dashboard", icon: LayoutDashboard },
-  { label: "Interviews", href: "/interviews", icon: BriefcaseBusiness },
+  { label: "Interview builder", href: "/interviews/new", icon: BriefcaseBusiness },
+  { label: "Interview results", href: "/results", icon: FileBarChart },
   { label: "Candidates", href: "/candidates", icon: Users },
   { label: "AI Interviewers", href: "/ai-interviewers", icon: PanelLeftClose },
   { label: "Question Library", href: "/question-library", icon: ClipboardList },
+  { label: "Knowledge", href: "/knowledge", icon: BookOpen },
   { label: "Analytics", href: "/analytics", icon: BarChart3 },
   { label: "Settings", href: "/settings", icon: Settings },
 ];

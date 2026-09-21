@@ -29,6 +29,44 @@ from app.services.ai_factory import get_embedder, get_llm
 from app.services.documents import extract_text, validate_upload
 
 router = APIRouter(tags=["documents"])
+
+_PROFILE_KEYS = {
+    "candidate_name",
+    "email",
+    "phone",
+    "summary",
+    "skills",
+    "experience",
+    "education",
+    "projects",
+    "certifications",
+    "achievements",
+    "source_evidence",
+}
+_MATCH_KEYS = {
+    "strong_matches",
+    "partial_matches",
+    "missing",
+    "claims_to_validate",
+    "relevant_projects",
+    "potential_interview_areas",
+}
+
+
+def _profile_row_kwargs(profile: ResumeProfile) -> dict:
+    data = profile.model_dump()
+    row = {k: data[k] for k in _PROFILE_KEYS if k in data}
+    row["raw_extraction"] = data
+    if data.get("claims") and not row.get("achievements"):
+        row["achievements"] = data["claims"][:10]
+    return row
+
+
+def _match_row_kwargs(match) -> dict:
+    data = match.model_dump() if hasattr(match, "model_dump") else dict(match)
+    row = {k: data.get(k) or [] for k in _MATCH_KEYS}
+    row["raw"] = data
+    return row
 settings = get_settings()
 
 
@@ -75,7 +113,7 @@ async def upload_document(
     await db.flush()
 
     # Index knowledge / guidelines into pgvector
-    if document_type in {"knowledge", "guideline", "question_bank", "policy"} and text.strip():
+    if document_type in {"knowledge", "guideline", "question_bank", "policy", "jd", "resume"} and text.strip():
         chunks = chunk_text(text)
         vectors = await get_embedder().embed(chunks) if chunks else []
         for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
@@ -107,10 +145,10 @@ async def upload_document(
                 await db.execute(select(CandidateProfile).where(CandidateProfile.candidate_id == cid))
             ).scalar_one_or_none()
             if existing:
-                for k, v in profile.model_dump().items():
-                    setattr(existing, k if k != "candidate_name" else "candidate_name", v)
+                for k, v in _profile_row_kwargs(profile).items():
+                    setattr(existing, k, v)
             else:
-                db.add(CandidateProfile(candidate_id=cid, **profile.model_dump()))
+                db.add(CandidateProfile(candidate_id=cid, **_profile_row_kwargs(profile)))
             parsed = profile.model_dump()
     if document_type == "jd" and jid:
         job = await db.get(Job, jid)
@@ -199,7 +237,7 @@ async def add_candidate(
     db.add(cand)
     await db.flush()
     if profile:
-        db.add(CandidateProfile(candidate_id=cand.id, **profile.model_dump()))
+        db.add(CandidateProfile(candidate_id=cand.id, **_profile_row_kwargs(profile)))
         # matching
         jp = (await db.execute(select(JobProfile).where(JobProfile.job_id == job_id))).scalar_one_or_none()
         if jp:
@@ -208,6 +246,7 @@ async def add_candidate(
                 required_skills=jp.required_skills or [],
                 preferred_skills=jp.preferred_skills or [],
                 experience=jp.experience or "",
+                seniority=(jp.raw_extraction or {}).get("seniority") or "",
                 responsibilities=jp.responsibilities or [],
                 technical_competencies=jp.technical_competencies or [],
                 behavioral_competencies=jp.behavioral_competencies or [],
@@ -218,8 +257,7 @@ async def add_candidate(
                     company_id=company_id,
                     job_id=job_id,
                     candidate_id=cand.id,
-                    **match.model_dump(),
-                    raw=match.model_dump(),
+                    **_match_row_kwargs(match),
                 )
             )
     await db.commit()

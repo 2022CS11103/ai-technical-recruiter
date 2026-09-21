@@ -89,7 +89,7 @@ def make_agent(db: Optional[AsyncSession] = None) -> InterviewAgent:
             score = sum(float(a) * float(b) for a, b in zip(qvec, row.embedding))
             scored.append((score, row))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [
+        hits = [
             {
                 "content": r.content,
                 "score": s,
@@ -97,9 +97,20 @@ def make_agent(db: Optional[AsyncSession] = None) -> InterviewAgent:
                 "competency": r.competency,
                 "source": r.source,
             }
-            for s, r in scored[:5]
+            for s, r in scored[:12]
             if s > 0.05
         ]
+        seen: set[str] = set()
+        deduped = []
+        for hit in hits:
+            key = " ".join(str(hit.get("content") or "").lower().split())[:150]
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(hit)
+            if len(deduped) >= 4:
+                break
+        return deduped
 
     manager = ConversationManager(get_llm(), rag_retrieve=rag_retrieve)
     return InterviewAgent(manager)

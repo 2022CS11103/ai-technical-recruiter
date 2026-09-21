@@ -10,7 +10,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy import text
 
-from app.api import auth, documents, interviews, jobs, knowledge
+from app.api import auth, documents, interviews, jobs, knowledge, platform
 from app.core.config import get_settings
 from app.core.redis_client import close_redis, get_redis
 from app.db.session import engine
@@ -62,6 +62,7 @@ app.include_router(jobs.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
 app.include_router(interviews.router, prefix="/api/v1")
 app.include_router(knowledge.router, prefix="/api/v1")
+app.include_router(platform.router, prefix="/api/v1")
 
 
 @app.get("/health")

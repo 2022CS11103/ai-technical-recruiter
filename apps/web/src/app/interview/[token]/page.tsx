@@ -4,15 +4,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { API_URL, api } from "@/lib/api";
-import { InterviewerAvatar } from "@/components/interview/InterviewerAvatar";
-import { Waveform } from "@/components/interview/Waveform";
+import { MicroInterviewRoom } from "@/components/interview/MicroInterviewRoom";
 
-type Phase = "setup" | "preparing" | "live" | "done" | "error";
+type Phase = "setup" | "preparing" | "briefing" | "live" | "done" | "error";
 type VoiceLang = "en-IN" | "hi-IN" | "en-US";
 
 type InterviewInfo = {
   role?: string;
   candidate_name?: string;
+  candidate_id?: string;
   interviewer_name?: string;
   duration_minutes?: number;
   token?: string;
@@ -64,16 +64,179 @@ type AnswerApiResponse = {
   audio_base64?: string | null;
   interviewer_name?: string;
   candidate_name?: string;
+  candidate_id?: string;
+  topic?: {
+    kind?: string;
+    label?: string | null;
+    project?: string | null;
+    claim?: string | null;
+    competency?: string | null;
+    section?: string | null;
+  };
+  meta?: Record<string, unknown>;
+  state?: Record<string, unknown>;
 };
 
 const SAMPLE_JD = "";
 const SAMPLE_RESUME = "";
+const MATERIALS_KEY = "zara_saved_materials";
 
-const SILENCE_MS = 2500;
+type SavedMaterials = {
+  jd: string;
+  resume: string;
+  jdFileName?: string;
+  resumeFileName?: string;
+  interviewer?: "Sarah" | "Rahul";
+};
+
+function loadSavedMaterials(): SavedMaterials | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(MATERIALS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as SavedMaterials;
+    if (!parsed?.jd?.trim() || !parsed?.resume?.trim()) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function saveMaterials(data: SavedMaterials) {
+  if (typeof window === "undefined") return;
+  try {
+    if (!data.jd.trim() || !data.resume.trim()) return;
+    localStorage.setItem(MATERIALS_KEY, JSON.stringify(data));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+function clearSavedMaterials() {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.removeItem(MATERIALS_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function looksLikeDontKnow(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+  return (
+    /\b(i don't know|i do not know|dont know|don't know|no idea|not sure|skip this|pass on this|pata nahi|nahi pata)\b/.test(
+      lower
+    ) && lower.split(/\s+/).length < 16
+  );
+}
+
+function isSubstantiveAnswer(text: string): boolean {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (!cleaned) return false;
+  if (looksLikeDontKnow(cleaned)) return true;
+  const words = cleaned.match(/[a-zA-Z']+/g) || [];
+  const fillers = new Set([
+    "um",
+    "uh",
+    "erm",
+    "hmm",
+    "hm",
+    "ah",
+    "oh",
+    "ok",
+    "okay",
+    "yes",
+    "yeah",
+    "yep",
+    "no",
+    "nope",
+    "right",
+    "sure",
+    "hello",
+    "hi",
+    "hey",
+    "thanks",
+    "thank",
+    "you",
+  ]);
+  const content = words.map((w) => w.toLowerCase()).filter((w) => !fillers.has(w));
+  return content.length >= 3;
+}
+
+const SILENCE_MS = 2800;
 /** Survives React Strict Mode remounts so greeting TTS only plays once per token. */
 const liveStartedTokens = new Set<string>();
 /** Tokens where mic was already opened after greeting (avoid double open on remount). */
 const micOpenedTokens = new Set<string>();
+
+/** Chrome truncates long utterances — speak one sentence at a time. */
+function splitSpeakChunks(text: string): string[] {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  const parts = cleaned.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [cleaned];
+  const chunks: string[] = [];
+  let buf = "";
+  for (const part of parts.map((p) => p.trim()).filter(Boolean)) {
+    if ((buf + " " + part).trim().length > 180 && buf) {
+      chunks.push(buf.trim());
+      buf = part;
+    } else {
+      buf = `${buf} ${part}`.trim();
+    }
+  }
+  if (buf) chunks.push(buf.trim());
+  return chunks.length ? chunks : [cleaned];
+}
+
+function writeWavString(view: DataView, offset: number, value: string) {
+  for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+}
+
+function encodeWav(buffer: AudioBuffer): Blob {
+  const length = buffer.length;
+  const sampleRate = buffer.sampleRate;
+  const channels = buffer.numberOfChannels;
+  const mono = new Float32Array(length);
+  for (let c = 0; c < channels; c++) {
+    const data = buffer.getChannelData(c);
+    for (let i = 0; i < length; i++) mono[i] += data[i] / channels;
+  }
+  const pcm = new Int16Array(length);
+  for (let i = 0; i < length; i++) {
+    const s = Math.max(-1, Math.min(1, mono[i]));
+    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  const bytes = new ArrayBuffer(44 + pcm.length * 2);
+  const view = new DataView(bytes);
+  writeWavString(view, 0, "RIFF");
+  view.setUint32(4, 36 + pcm.length * 2, true);
+  writeWavString(view, 8, "WAVE");
+  writeWavString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeWavString(view, 36, "data");
+  view.setUint32(40, pcm.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < pcm.length; i++, offset += 2) view.setInt16(offset, pcm[i], true);
+  return new Blob([bytes], { type: "audio/wav" });
+}
+
+async function blobToWav(blob: Blob): Promise<Blob> {
+  const AC = window.AudioContext || (window as SpeechWindow).webkitAudioContext;
+  if (!AC) return blob;
+  const ctx = new AC();
+  try {
+    const raw = await blob.arrayBuffer();
+    const audio = await ctx.decodeAudioData(raw.slice(0));
+    return encodeWav(audio);
+  } finally {
+    await ctx.close().catch(() => null);
+  }
+}
 
 function snapKey(token: string) {
   return `atr-interview-snap:${token}`;
@@ -101,22 +264,21 @@ export default function CandidateInterviewPage() {
   const initialToken = params.token === "demo" || params.token === "try" ? "" : params.token;
 
   const [token, setToken] = useState(initialToken);
-  const [phase, setPhase] = useState<Phase>(initialToken ? "live" : "setup");
+  const [phase, setPhase] = useState<Phase>(initialToken ? "briefing" : "setup");
   const [jd, setJd] = useState(SAMPLE_JD);
   const [resume, setResume] = useState(SAMPLE_RESUME);
   const [jdFileName, setJdFileName] = useState("");
   const [resumeFileName, setResumeFileName] = useState("");
+  const [materialsSaved, setMaterialsSaved] = useState(false);
   const [interviewer, setInterviewer] = useState<"Sarah" | "Rahul">("Sarah");
   const [info, setInfo] = useState<InterviewInfo | null>(null);
   const [connection, setConnection] = useState<"offline" | "connecting" | "live">(
     initialToken ? "connecting" : "offline"
   );
-  const [agentState, setAgentState] = useState<"listening" | "thinking" | "speaking" | "idle">(
-    initialToken ? "thinking" : "idle"
-  );
-  const [question, setQuestion] = useState(
-    initialToken ? "Connecting… your question will appear here." : ""
-  );
+  const [agentState, setAgentState] = useState<"listening" | "thinking" | "speaking" | "idle">("idle");
+  const [question, setQuestion] = useState("");
+  const [spokenDisplay, setSpokenDisplay] = useState("");
+  const [topicLabel, setTopicLabel] = useState<string | null>(null);
   const [partialHeard, setPartialHeard] = useState("");
   const [lastAnswer, setLastAnswer] = useState("");
   const [micHint, setMicHint] = useState("Mic idle");
@@ -131,7 +293,6 @@ export default function CandidateInterviewPage() {
   const [voiceLang, setVoiceLang] = useState<VoiceLang>("en-IN");
   const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
   const [micDeviceId, setMicDeviceId] = useState<string>("");
-  const [transcriptOpen, setTranscriptOpen] = useState(true);
   const [aiStatus, setAiStatus] = useState<{
     llm: boolean;
     stt: boolean;
@@ -168,12 +329,46 @@ export default function CandidateInterviewPage() {
   voiceLangRef.current = voiceLang;
   const micDeviceIdRef = useRef(micDeviceId);
   micDeviceIdRef.current = micDeviceId;
+  const aiStatusRef = useRef(aiStatus);
+  aiStatusRef.current = aiStatus;
+  const maxRecTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const speechUnlockedRef = useRef(false);
 
   const timer = useMemo(() => {
     const m = Math.floor(secondsLeft / 60).toString().padStart(2, "0");
     const s = (secondsLeft % 60).toString().padStart(2, "0");
     return `${m}:${s}`;
   }, [secondsLeft]);
+
+  useEffect(() => {
+    const saved = loadSavedMaterials();
+    if (!saved) return;
+    setJd(saved.jd);
+    setResume(saved.resume);
+    setJdFileName(saved.jdFileName || "");
+    setResumeFileName(saved.resumeFileName || "");
+    if (saved.interviewer === "Sarah" || saved.interviewer === "Rahul") {
+      setInterviewer(saved.interviewer);
+    }
+    setMaterialsSaved(true);
+    setConsent(true);
+  }, []);
+
+  const persistMaterialsNow = useCallback(
+    (next?: Partial<SavedMaterials>) => {
+      const payload: SavedMaterials = {
+        jd: next?.jd ?? jd,
+        resume: next?.resume ?? resume,
+        jdFileName: next?.jdFileName ?? jdFileName,
+        resumeFileName: next?.resumeFileName ?? resumeFileName,
+        interviewer: next?.interviewer ?? interviewer,
+      };
+      if (!payload.jd.trim() || !payload.resume.trim()) return;
+      saveMaterials(payload);
+      setMaterialsSaved(true);
+    },
+    [jd, resume, jdFileName, resumeFileName, interviewer]
+  );
 
   // Timer only after Sarah actually starts (not while stuck on Connecting)
   useEffect(() => {
@@ -277,30 +472,32 @@ export default function CandidateInterviewPage() {
         const settingsId = track?.getSettings?.().deviceId;
         if (settingsId) setMicDeviceId(settingsId);
 
-        if (!micAudioCtxRef.current || micAudioCtxRef.current.state === "closed") {
-          const AC = window.AudioContext || (window as SpeechWindow).webkitAudioContext;
-          if (!AC) {
-            setMicHint("AudioContext unavailable in this browser");
-            return null;
-          }
-          micAudioCtxRef.current = new AC();
+        if (micAudioCtxRef.current) {
+          await micAudioCtxRef.current.close().catch(() => null);
+          micAudioCtxRef.current = null;
         }
-        const ctx = micAudioCtxRef.current;
+        micAnalyserRef.current = null;
+
+        const AC = window.AudioContext || (window as SpeechWindow).webkitAudioContext;
+        if (!AC) {
+          setMicHint("AudioContext unavailable in this browser");
+          setMicReady(true);
+          return stream;
+        }
+        const ctx = new AC();
+        micAudioCtxRef.current = ctx;
         if (ctx.state === "suspended") await ctx.resume();
 
-        if (!micAnalyserRef.current) {
-          const source = ctx.createMediaStreamSource(stream);
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 2048;
-          analyser.smoothingTimeConstant = 0.2;
-          const gain = ctx.createGain();
-          gain.gain.value = 8;
-          source.connect(gain);
-          gain.connect(analyser);
-          micAnalyserRef.current = analyser;
-        }
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.15;
+        const gain = ctx.createGain();
+        gain.gain.value = 10;
+        source.connect(gain);
+        gain.connect(analyser);
+        micAnalyserRef.current = analyser;
 
-        const analyser = micAnalyserRef.current;
         const data = new Uint8Array(analyser.fftSize);
         const tick = () => {
           if (!micAnalyserRef.current) return;
@@ -341,25 +538,32 @@ export default function CandidateInterviewPage() {
 
   const speakBrowser = useCallback((text: string, voiceHint: string, playId: number) => {
     return new Promise<void>(async (resolve) => {
-      if (typeof window === "undefined" || !window.speechSynthesis) {
+      if (typeof window === "undefined" || !window.speechSynthesis || !text.trim()) {
         resolve();
         return;
       }
       const synth = window.speechSynthesis;
-      synth.cancel();
+      try {
+        synth.cancel();
+      } catch {
+        /* ignore */
+      }
+      await new Promise((r) => setTimeout(r, 150));
+      if (playId !== playIdRef.current) {
+        resolve();
+        return;
+      }
 
-      // Wait briefly for voices (Chrome loads them async)
       let voices = synth.getVoices();
       if (!voices.length) {
         await new Promise<void>((r) => {
           const done = () => r();
           synth.addEventListener("voiceschanged", done, { once: true });
-          setTimeout(done, 600);
+          setTimeout(done, 700);
         });
         voices = synth.getVoices();
       }
 
-      const utter = new SpeechSynthesisUtterance(text);
       const preferFemale = voiceHint.toLowerCase() === "sarah";
       const picked =
         voices.find((v) =>
@@ -369,43 +573,107 @@ export default function CandidateInterviewPage() {
         ) ||
         voices.find((v) => /en-IN|en-GB|en-US/i.test(v.lang)) ||
         voices[0];
-      if (picked) utter.voice = picked;
-      utter.rate = 1.02;
-      utter.pitch = preferFemale ? 1.05 : 1.0;
 
-      let finished = false;
-      const finish = () => {
-        if (finished) return;
-        finished = true;
-        resolve();
+      let revealed = 0;
+      const revealTo = (abs: number) => {
+        if (playId !== playIdRef.current) return;
+        revealed = Math.max(revealed, Math.min(text.length, abs));
+        setSpokenDisplay(text.slice(0, revealed));
       };
-      utter.onend = finish;
-      utter.onerror = finish;
-      // Safety: never hang forever if browser drops onend
-      const safety = window.setTimeout(finish, Math.min(60000, 2500 + text.length * 80));
+      setSpokenDisplay("");
 
-      if (playId !== playIdRef.current) {
-        window.clearTimeout(safety);
-        finish();
-        return;
-      }
+      const speakOne = (chunk: string, base: number) =>
+        new Promise<void>((done) => {
+          if (playId !== playIdRef.current) {
+            done();
+            return;
+          }
+          const utter = new SpeechSynthesisUtterance(chunk);
+          if (picked) utter.voice = picked;
+          utter.lang = picked?.lang || "en-US";
+          utter.rate = 0.98;
+          utter.pitch = preferFemale ? 1.05 : 1.0;
+          utter.volume = 1;
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            revealTo(base + chunk.length);
+            done();
+          };
+          utter.onboundary = (ev: SpeechSynthesisEvent) => {
+            if (playId !== playIdRef.current) return;
+            const local = typeof ev.charIndex === "number" ? ev.charIndex : 0;
+            let end = base + local;
+            while (end < text.length && !/\s/.test(text[end]!)) end += 1;
+            revealTo(Math.max(end, base + local + 1));
+          };
+          utter.onend = finish;
+          utter.onerror = finish;
+          // Fallback typewriter if browser skips onboundary
+          const words = chunk.split(/(\s+)/).filter(Boolean);
+          let wi = 0;
+          let acc = base;
+          const tick = window.setInterval(() => {
+            if (settled || playId !== playIdRef.current) {
+              window.clearInterval(tick);
+              return;
+            }
+            if (wi >= words.length) {
+              window.clearInterval(tick);
+              return;
+            }
+            acc += words[wi]!.length;
+            wi += 1;
+            revealTo(acc);
+          }, Math.max(90, Math.min(220, 1800 / Math.max(words.length, 1))));
+
+          const waitMs = Math.min(60000, 2500 + chunk.length * 70);
+          const safety = window.setTimeout(finish, waitMs);
+          try {
+            synth.resume();
+          } catch {
+            /* ignore */
+          }
+          synth.speak(utter);
+          const poke = window.setTimeout(() => {
+            try {
+              if (!settled && synth.paused) synth.resume();
+            } catch {
+              /* ignore */
+            }
+          }, 600);
+          utter.addEventListener("end", () => {
+            window.clearTimeout(safety);
+            window.clearTimeout(poke);
+            window.clearInterval(tick);
+          });
+          utter.addEventListener("error", () => {
+            window.clearTimeout(safety);
+            window.clearTimeout(poke);
+            window.clearInterval(tick);
+          });
+        });
+
       setAgentState("speaking");
-      // Chrome sometimes needs resume() after cancel
-      try {
-        synth.resume();
-      } catch {
-        /* ignore */
+      let cursor = 0;
+      for (const chunk of splitSpeakChunks(text)) {
+        if (playId !== playIdRef.current) break;
+        const found = text.indexOf(chunk, cursor);
+        const base = found >= 0 ? found : cursor;
+        await speakOne(chunk, base);
+        cursor = base + chunk.length;
+        revealTo(cursor);
+        await new Promise((r) => setTimeout(r, 60));
       }
-      synth.speak(utter);
-      utter.addEventListener("end", () => window.clearTimeout(safety));
-      utter.addEventListener("error", () => window.clearTimeout(safety));
+      if (playId === playIdRef.current) setSpokenDisplay(text);
+      resolve();
     });
   }, []);
 
   const playAgentSpeech = useCallback(
-    async (text: string, audioB64?: string | null, name?: string) => {
+    async (text: string, _audioB64?: string | null, name?: string, opts?: { keepPinned?: boolean }) => {
       const playId = ++playIdRef.current;
-      // Stop any previous overlapping speech immediately
       if (typeof window !== "undefined") window.speechSynthesis?.cancel();
       if (audioRef.current) {
         try {
@@ -416,28 +684,19 @@ export default function CandidateInterviewPage() {
         }
       }
 
-      setQuestion(text);
+      if (!opts?.keepPinned) {
+        setQuestion(text);
+        setSpokenDisplay("");
+      }
       setAgentState("speaking");
       setMicHint(`${name || interviewer} is speaking…`);
-
-      if (audioB64) {
-        try {
-          if (!audioRef.current) audioRef.current = new Audio();
-          const audio = audioRef.current;
-          audio.src = `data:audio/mpeg;base64,${audioB64}`;
-          await new Promise<void>((resolve, reject) => {
-            audio.onended = () => resolve();
-            audio.onerror = () => reject(new Error("audio error"));
-            audio.play().catch(reject);
-          });
-          return;
-        } catch {
-          if (playId !== playIdRef.current) return;
-          // only browser fallback if server audio failed
-        }
-      }
+      // Always use browser TTS. Waiting on server edge-tts was hanging /answer
+      // so the UI never heard Sarah and never reopened the mic.
       if (playId === playIdRef.current) {
         await speakBrowser(text, name || interviewer, playId);
+      }
+      if (playId === playIdRef.current && !opts?.keepPinned) {
+        setSpokenDisplay(text);
       }
     },
     [interviewer, speakBrowser]
@@ -449,6 +708,10 @@ export default function CandidateInterviewPage() {
     if (vadTimerRef.current) {
       clearTimeout(vadTimerRef.current);
       vadTimerRef.current = null;
+    }
+    if (maxRecTimerRef.current) {
+      clearTimeout(maxRecTimerRef.current);
+      maxRecTimerRef.current = null;
     }
     speechStartedRef.current = false;
     // Keep level meter running so bars stay live; only stop recognition/recorder
@@ -497,6 +760,7 @@ export default function CandidateInterviewPage() {
           interviewer_name: snap.interviewer_name,
         }));
         setQuestion(snap.reply);
+        setSpokenDisplay(snap.reply);
         setTranscript([{ role: "interviewer", content: snap.reply }]);
         if (snap.duration_minutes) setSecondsLeft(snap.duration_minutes * 60);
       } else {
@@ -511,6 +775,8 @@ export default function CandidateInterviewPage() {
           });
           if (res.reply) {
             setQuestion(res.reply);
+            setSpokenDisplay(res.reply);
+            setTopicLabel(res.topic?.label || null);
             setTranscript([{ role: "interviewer", content: res.reply }]);
             saveInterviewSnap(activeToken, {
               reply: res.reply,
@@ -537,6 +803,17 @@ export default function CandidateInterviewPage() {
   const submitAnswer = useCallback(
     async (text: string) => {
       if (!text.trim() || processingRef.current || !token) return;
+      if (!isSubstantiveAnswer(text)) {
+        setMicHint("Need a real answer (or say “I don’t know”) — still on this question");
+        answerBufferRef.current = "";
+        lastHeardRef.current = "";
+        setPartialHeard("");
+        setAgentState("listening");
+        window.setTimeout(() => {
+          if (!processingRef.current) startListeningRef.current();
+        }, 350);
+        return;
+      }
       processingRef.current = true;
       stopListening();
       answerBufferRef.current = "";
@@ -554,10 +831,19 @@ export default function CandidateInterviewPage() {
           auth: false,
         });
         if (res.status === "completed") {
+          if (res.candidate_id) {
+            setInfo((prev) => ({ ...prev, candidate_id: res.candidate_id }));
+            try {
+              sessionStorage.setItem("zara_last_candidate_id", res.candidate_id);
+            } catch {
+              /* ignore */
+            }
+          }
           setPhase("done");
           setAgentState("idle");
           const bye = "Thanks for your time today. That wraps up the interview.";
           setQuestion(bye);
+          setTopicLabel(null);
           setMicHint("Interview finished");
           console.log("%cAI:", "color:#2ec4b6;font-weight:bold", bye);
           await playAgentSpeech(bye, res.audio_base64, interviewer);
@@ -565,6 +851,20 @@ export default function CandidateInterviewPage() {
         }
         const reply = res.reply || "Thanks — let's continue.";
         console.log("%cAI:", "color:#2ec4b6;font-weight:bold", reply);
+        const action = String(res.meta?.action || "");
+        if (action === "AWAIT_ANSWER") {
+          setMicHint("Still on this question — answer it, or say you don’t know");
+          setTranscript((t) => [...t, { role: "interviewer", content: reply }]);
+          await playAgentSpeech(
+            "Still need your answer on that — take your time, or say you don’t know.",
+            res.audio_base64,
+            interviewer,
+            { keepPinned: true }
+          );
+          openMicAfterAgent();
+          return;
+        }
+        setTopicLabel(res.topic?.label || null);
         setTranscript((t) => [...t, { role: "interviewer", content: reply }]);
         setMicHint(`${interviewer} is speaking…`);
         await playAgentSpeech(reply, res.audio_base64, interviewer);
@@ -623,17 +923,25 @@ export default function CandidateInterviewPage() {
       }
     });
     mediaRecorderRef.current = null;
-    const blob = new Blob(recordedChunksRef.current, { type: rec.mimeType || "audio/webm" });
+    const rawBlob = new Blob(recordedChunksRef.current, { type: rec.mimeType || "audio/webm" });
     recordedChunksRef.current = [];
     speechStartedRef.current = false;
-    if (blob.size < 800) {
-      setMicHint("Didn’t catch that — speak again");
+    if (rawBlob.size < 2500) {
+      setMicHint("Didn’t catch that — speak again, then tap I’m done");
       window.setTimeout(() => startListeningRef.current(), 400);
       return;
     }
     try {
+      let upload = rawBlob;
+      let filename = "answer.wav";
+      try {
+        upload = await blobToWav(rawBlob);
+      } catch (convErr) {
+        console.warn("[stt] wav convert failed, sending original", convErr);
+        filename = rec.mimeType?.includes("mp4") ? "answer.mp4" : "answer.webm";
+      }
       const fd = new FormData();
-      fd.append("file", blob, "answer.webm");
+      fd.append("file", upload, filename);
       const res = await fetch(`${API_URL}/api/v1/interview-links/${activeToken}/stt`, {
         method: "POST",
         body: fd,
@@ -645,7 +953,7 @@ export default function CandidateInterviewPage() {
           setMicHint("Speak again — or type below (add Groq key for Whisper STT)");
           setError("Add LLM_API_KEY in apps/api/.env for voice→text, then restart API.");
         } else {
-          setMicHint("Couldn’t hear clearly — speak again");
+          setMicHint("Couldn’t hear clearly — speak again, then tap I’m done");
         }
         window.setTimeout(() => startListeningRef.current(), 500);
         return;
@@ -678,7 +986,6 @@ export default function CandidateInterviewPage() {
     setMicHint("Listening — speak naturally, then pause ~2s");
 
     if (audioRef.current) audioRef.current.pause();
-    if (typeof window !== "undefined") window.speechSynthesis?.cancel();
 
     const stream = await startLevelMeter(micDeviceIdRef.current || undefined);
     if (!stream) {
@@ -686,7 +993,7 @@ export default function CandidateInterviewPage() {
       return;
     }
 
-    const useWhisper = Boolean(aiStatus?.stt);
+    const useWhisper = Boolean(aiStatusRef.current?.stt);
 
     if (useWhisper) {
       try {
@@ -694,20 +1001,30 @@ export default function CandidateInterviewPage() {
           ? "audio/webm;codecs=opus"
           : MediaRecorder.isTypeSupported("audio/webm")
             ? "audio/webm"
-            : "";
+            : MediaRecorder.isTypeSupported("audio/mp4")
+              ? "audio/mp4"
+              : "";
         const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
         mediaRecorderRef.current = recorder;
         recorder.ondataavailable = (ev) => {
-          if (ev.data && ev.data.size > 0) recordedChunksRef.current.push(ev.data);
+          if (ev.data && ev.data.size > 0) {
+            recordedChunksRef.current.push(ev.data);
+            const total = recordedChunksRef.current.reduce((n, b) => n + b.size, 0);
+            if (total > 2500 && !speechStartedRef.current) {
+              speechStartedRef.current = true;
+              setMicHint("Hearing you… pause ~2s or tap I’m done");
+              setPartialHeard("…");
+            }
+          }
         };
-        recorder.start(250);
+        recorder.start();
         setMicReady(true);
 
         const armVadCommit = () => {
           if (vadTimerRef.current) clearTimeout(vadTimerRef.current);
           vadTimerRef.current = setTimeout(() => {
             if (!listeningRef.current || processingRef.current || !speechStartedRef.current) return;
-            if (micLevelRef.current > 0.04) {
+            if (micLevelRef.current > 0.035) {
               armVadCommit();
               return;
             }
@@ -717,17 +1034,21 @@ export default function CandidateInterviewPage() {
 
         const watch = () => {
           if (!listeningRef.current || processingRef.current) return;
-          if (micLevelRef.current > 0.05) {
+          if (micLevelRef.current > 0.028) {
             if (!speechStartedRef.current) {
               speechStartedRef.current = true;
-              setMicHint("Hearing you… pause when finished");
+              setMicHint("Hearing you… pause ~2s or tap I’m done");
               setPartialHeard("…");
             }
             armVadCommit();
           }
-          window.setTimeout(watch, 100);
+          window.setTimeout(watch, 80);
         };
         watch();
+        if (maxRecTimerRef.current) clearTimeout(maxRecTimerRef.current);
+        maxRecTimerRef.current = setTimeout(() => {
+          if (listeningRef.current && !processingRef.current) void flushVoiceRecording();
+        }, 20000);
         return;
       } catch (e) {
         console.warn("[mic] MediaRecorder failed, falling back to browser speech", e);
@@ -798,7 +1119,7 @@ export default function CandidateInterviewPage() {
       setMicHint("Could not open mic — type your answer below");
       listeningRef.current = false;
     }
-  }, [stopListening, startLevelMeter, flushVoiceRecording, aiStatus?.stt, armSilenceCommit]);
+  }, [stopListening, startLevelMeter, flushVoiceRecording, armSilenceCommit]);
 
   const startListening = useCallback(() => {
     if (processingRef.current) return;
@@ -808,6 +1129,49 @@ export default function CandidateInterviewPage() {
   useEffect(() => {
     startListeningRef.current = startListening;
   }, [startListening]);
+
+  // Chrome pauses speechSynthesis after ~15s idle; keep it awake during the interview.
+  useEffect(() => {
+    if (phase !== "live") return;
+    const id = window.setInterval(() => {
+      try {
+        if (window.speechSynthesis?.paused) window.speechSynthesis.resume();
+      } catch {
+        /* ignore */
+      }
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [phase]);
+
+  function unlockSpeech() {
+    if (speechUnlockedRef.current || typeof window === "undefined") return;
+    speechUnlockedRef.current = true;
+    try {
+      const synth = window.speechSynthesis;
+      if (synth) {
+        const warm = new SpeechSynthesisUtterance(".");
+        warm.volume = 0;
+        synth.speak(warm);
+        synth.cancel();
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (!audioRef.current) audioRef.current = new Audio();
+      audioRef.current.volume = 0;
+      audioRef.current.src =
+        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+      void audioRef.current.play().finally(() => {
+        if (audioRef.current) {
+          audioRef.current.pause();
+          audioRef.current.volume = 1;
+        }
+      });
+    } catch {
+      /* ignore */
+    }
+  }
 
   // Safety net: if UI sits stuck after start finished (remount wiped state)
   useEffect(() => {
@@ -841,9 +1205,11 @@ export default function CandidateInterviewPage() {
       if (kind === "jd") {
         setJd(data.text);
         setJdFileName(file.name);
+        persistMaterialsNow({ jd: data.text, jdFileName: file.name });
       } else {
         setResume(data.text);
         setResumeFileName(file.name);
+        persistMaterialsNow({ resume: data.text, resumeFileName: file.name });
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Upload failed");
@@ -861,19 +1227,18 @@ export default function CandidateInterviewPage() {
       setError("Please provide both a job description and a resume.");
       return;
     }
-    // Stay on this page — no remount. ElevenLabs-style: click → agent greets → mic opens.
-    setPhase("live");
-    setAgentState("thinking");
-    setQuestion(`${interviewer} is getting ready…`);
-    setMicHint("Starting…");
+    // Stay on this page — briefing first (micro1-style), then voice starts on CTA.
+    setPhase("briefing");
+    setAgentState("idle");
+    setQuestion("");
+    setMicHint("Mic idle");
     setError("");
     setConnection("connecting");
-    // User-gesture: open mic now and KEEP it for the whole interview
+    unlockSpeech();
     void startLevelMeter();
     try {
       const created = await api<InterviewInfo & { token: string }>("/api/v1/interview-links/self-serve", {
         method: "POST",
-        auth: false,
         body: JSON.stringify({
           jd_text: jd,
           resume_text: resume,
@@ -883,12 +1248,25 @@ export default function CandidateInterviewPage() {
       });
       setToken(created.token);
       setInfo(created);
+      if (created.candidate_id) {
+        try {
+          sessionStorage.setItem("zara_last_candidate_id", created.candidate_id);
+        } catch {
+          /* ignore */
+        }
+      }
       setSecondsLeft((created.duration_minutes || 30) * 60);
-      // Update URL without remounting (remount was wiping mic + greeting)
+      persistMaterialsNow({
+        jd,
+        resume,
+        jdFileName,
+        resumeFileName,
+        interviewer,
+      });
       if (typeof window !== "undefined") {
         window.history.replaceState(null, "", `/interview/${created.token}`);
       }
-      await beginLive(created.token, created.interviewer_name || interviewer);
+      setConnection("live");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not start interview");
       setPhase("setup");
@@ -970,6 +1348,7 @@ export default function CandidateInterviewPage() {
       });
       setTranscript([{ role: "interviewer", content: res.reply }]);
       setQuestion(res.reply || "");
+      setTopicLabel(res.topic?.label || null);
       setMicHint(`${res.interviewer_name || name} is speaking…`);
       console.log("%cAI:", "color:#2ec4b6;font-weight:bold", res.reply);
       // Prefer browser TTS for greeting (instant); server audio optional
@@ -1014,7 +1393,9 @@ export default function CandidateInterviewPage() {
         setInterviewer((data.interviewer_name || "Sarah") as "Sarah" | "Rahul");
         setSecondsLeft((data.duration_minutes || 30) * 60);
         setConsent(true);
-        await beginLive(initialToken, data.interviewer_name || "Sarah");
+        setPhase("briefing");
+        setConnection("live");
+        void startLevelMeter();
       })
       .catch((e) => {
         setError(e.message);
@@ -1026,7 +1407,18 @@ export default function CandidateInterviewPage() {
   async function endInterview() {
     stopListening();
     if (token) {
-      await api(`/api/v1/interview-links/${token}/finish`, { method: "POST", auth: false }).catch(() => null);
+      const finished = await api<{ candidate_id?: string }>(
+        `/api/v1/interview-links/${token}/finish`,
+        { method: "POST", auth: false }
+      ).catch(() => null);
+      if (finished?.candidate_id) {
+        setInfo((prev) => ({ ...prev, candidate_id: finished.candidate_id }));
+        try {
+          sessionStorage.setItem("zara_last_candidate_id", finished.candidate_id);
+        } catch {
+          /* ignore */
+        }
+      }
     }
     setPhase("done");
     setAgentState("idle");
@@ -1038,9 +1430,28 @@ export default function CandidateInterviewPage() {
         <Brand />
         <h1 className="font-display mt-6 text-4xl">Voice interview</h1>
         <p className="mt-2 max-w-2xl text-[var(--muted)]">
-          Upload or paste a JD and resume. Then talk with {interviewer} like a normal interview — pause for 3 seconds
-          when you finish an answer and they’ll continue.
+          Upload or paste a JD and resume once — they stay saved until you change them. Talk with {interviewer} like a
+          normal interview; pause ~3 seconds when you finish an answer.
         </p>
+        {materialsSaved && (
+          <div className="mt-4 flex flex-wrap items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50/80 px-4 py-3 text-sm text-emerald-800">
+            <span>Saved JD & resume ready — reuse without re-uploading.</span>
+            <button
+              type="button"
+              className="text-xs font-semibold underline underline-offset-2"
+              onClick={() => {
+                clearSavedMaterials();
+                setJd("");
+                setResume("");
+                setJdFileName("");
+                setResumeFileName("");
+                setMaterialsSaved(false);
+              }}
+            >
+              Clear & replace
+            </button>
+          </div>
+        )}
 
         <div className="mt-8 grid gap-4 max-w-3xl">
           <div>
@@ -1050,7 +1461,10 @@ export default function CandidateInterviewPage() {
                 <button
                   key={name}
                   type="button"
-                  onClick={() => setInterviewer(name)}
+                  onClick={() => {
+                    setInterviewer(name);
+                    persistMaterialsNow({ interviewer: name });
+                  }}
                   className={`btn ${interviewer === name ? "btn-primary" : "btn-secondary"}`}
                 >
                   {name}
@@ -1079,7 +1493,11 @@ export default function CandidateInterviewPage() {
             <textarea
               className="input min-h-36"
               value={jd}
-              onChange={(e) => setJd(e.target.value)}
+              onChange={(e) => {
+                setJd(e.target.value);
+                setMaterialsSaved(false);
+              }}
+              onBlur={() => persistMaterialsNow()}
               placeholder="Paste the job description here, or upload PDF/DOCX/TXT above…"
             />
           </div>
@@ -1104,7 +1522,11 @@ export default function CandidateInterviewPage() {
             <textarea
               className="input min-h-36"
               value={resume}
-              onChange={(e) => setResume(e.target.value)}
+              onChange={(e) => {
+                setResume(e.target.value);
+                setMaterialsSaved(false);
+              }}
+              onBlur={() => persistMaterialsNow()}
               placeholder="Paste YOUR resume here (with your real name), or upload PDF/DOCX/TXT above…"
             />
           </div>
@@ -1139,32 +1561,38 @@ export default function CandidateInterviewPage() {
   }
 
   if (phase === "done") {
+    const dossierId = info?.candidate_id;
     return (
-      <div className="zara-room grid place-items-center p-5" data-testid="candidate-complete-room">
+      <div className="micro-room grid place-items-center p-5" data-testid="candidate-complete-room">
         <div className="w-full max-w-lg text-center">
-          <div className="mx-auto grid size-16 place-items-center rounded-full border border-emerald-400/25 bg-emerald-400/10 text-emerald-300 text-2xl">
+          <div className="mx-auto grid size-16 place-items-center rounded-full bg-white text-emerald-600 text-2xl shadow">
             ✓
           </div>
-          <p className="mt-8 font-mono-zara text-[10px] text-emerald-300">Interview complete</p>
-          <h1 className="mt-3 text-3xl font-semibold tracking-tight">Thanks for your time.</h1>
-          <p className="mt-4 text-sm leading-6 text-slate-400">
-            Your responses have been submitted. The hiring team will be in touch with next steps.
+          <p className="mt-8 text-xs font-semibold uppercase tracking-[0.2em] text-indigo-500">Interview complete</p>
+          <h1 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900">Thanks for your time.</h1>
+          <p className="mt-4 text-sm leading-6 text-slate-600">
+            Responses are stored as evidence against the interview plan. The hiring team reviews the dossier, not a vibe score.
           </p>
-          <div className="mt-8 rounded-lg border border-white/10 bg-white/[.03] p-5 text-left text-sm">
+          <div className="mt-8 rounded-2xl bg-white/70 p-5 text-left text-sm shadow-sm">
             <div className="flex justify-between">
-              <span className="text-slate-400">Interviewer</span>
-              <span>{interviewer}</span>
+              <span className="text-slate-500">Interviewer</span>
+              <span className="text-slate-900">{interviewer}</span>
             </div>
             <div className="mt-3 flex justify-between">
-              <span className="text-slate-400">Role</span>
-              <span>{info?.role || "Technical interview"}</span>
-            </div>
-            <div className="mt-3 flex justify-between">
-              <span className="text-slate-400">Time left</span>
-              <span>{timer}</span>
+              <span className="text-slate-500">Role</span>
+              <span className="text-slate-900">{info?.role || "Technical interview"}</span>
             </div>
           </div>
-          <Link className="btn btn-primary mt-6 inline-flex w-full" href="/interview/try">
+          {dossierId ? (
+            <Link className="micro-cta mt-6 inline-flex w-full justify-center no-underline" href={`/candidates/${dossierId}`}>
+              View recruiter dossier
+            </Link>
+          ) : (
+            <Link className="micro-cta mt-6 inline-flex w-full justify-center no-underline" href="/candidates">
+              Open candidates
+            </Link>
+          )}
+          <Link className="mt-3 inline-flex w-full justify-center text-sm text-slate-500 hover:text-slate-800" href="/interview/try">
             Back to start
           </Link>
         </div>
@@ -1172,219 +1600,75 @@ export default function CandidateInterviewPage() {
     );
   }
 
-  const statusLabel =
-    agentState === "speaking"
-      ? `${interviewer} is speaking`
-      : agentState === "thinking"
-        ? "Thinking…"
-        : agentState === "listening"
-          ? "Listening…"
-          : "Connecting…";
 
-  const statusClass =
-    agentState === "listening" ? "listening" : agentState === "thinking" ? "thinking" : "";
+  if (phase === "briefing" || phase === "live") {
+    const qIndex = Math.min(transcript.filter((t) => t.role === "interviewer").length || 1, 8);
+    const stageIndex = Math.min(3, Math.floor((qIndex - 1) / 2));
+    const stages = ["Introduction", "Resume", "Technical", "Wrap-up"];
+    const activeToken = token || initialToken;
 
-  const qIndex = Math.min(transcript.filter((t) => t.role === "interviewer").length || 1, 8);
-  const progressPct = Math.max(12, (qIndex / 8) * 100);
+    return (
+      <MicroInterviewRoom
+        mode={phase === "briefing" ? "briefing" : "live"}
+        interviewer={interviewer}
+        role={info?.role}
+        candidateName={info?.candidate_name}
+        timer={timer}
+        question={question}
+        spokenDisplay={spokenDisplay}
+        topicLabel={topicLabel}
+        partialHeard={partialHeard}
+        agentState={agentState}
+        micHint={micHint}
+        micLevel={micLevel}
+        micDevices={micDevices}
+        micDeviceId={micDeviceId}
+        voiceLang={voiceLang}
+        stages={stages}
+        stageIndex={stageIndex}
+        error={error}
+        onStart={() => {
+          if (!activeToken) return;
+          setConsent(true);
+          unlockSpeech();
+          void startLevelMeter(micDeviceId || undefined);
+          void beginLive(activeToken, interviewer);
+        }}
+        onEnd={endInterview}
+        onMicDevice={(id) => {
+          setMicDeviceId(id);
+          void startLevelMeter(id || undefined).then(() => startListeningRef.current());
+        }}
+        onVoiceLang={(lang) => {
+          setVoiceLang(lang);
+          startListeningRef.current();
+        }}
+        onMicClick={() => {
+          if (agentState === "listening") {
+            if (mediaRecorderRef.current) void flushVoiceRecording();
+            else {
+              const textAns = (answerBufferRef.current || lastHeardRef.current).trim();
+              if (textAns) void submitAnswer(textAns);
+              else setMicHint("Say something, then tap mic again");
+            }
+          } else if (agentState === "speaking" && question) {
+            unlockSpeech();
+            void playAgentSpeech(question, null, interviewer);
+          } else if (phase === "live") {
+            startListeningRef.current();
+          }
+        }}
+        onReplay={() => {
+          if (question) {
+            unlockSpeech();
+            void playAgentSpeech(question, null, interviewer);
+          }
+        }}
+      />
+    );
+  }
 
-  return (
-    <div className="zara-room" data-testid="candidate-active-room">
-      <div className="zara-glow" />
-
-      <header className="relative flex h-16 items-center justify-between border-b border-white/10 px-5 sm:px-8">
-        <div>
-          <span className="font-mono-zara text-sm font-semibold tracking-[.28em]">ZARA</span>
-          <span className="ml-4 hidden border-l border-white/15 pl-4 text-xs text-slate-500 sm:inline">
-            {info?.role || "Technical interview"}
-          </span>
-        </div>
-        <div className="flex items-center gap-3 text-xs text-slate-500">
-          <span className="font-mono-zara tracking-normal normal-case">{timer}</span>
-          {info?.candidate_name && <span className="hidden sm:inline">{info.candidate_name}</span>}
-        </div>
-      </header>
-
-      <main className="relative mx-auto flex min-h-[calc(100svh-64px)] max-w-6xl flex-col items-center justify-center px-5 py-8">
-        <div className="mb-8 flex w-full max-w-3xl items-center justify-between">
-          <div>
-            <p className="font-mono-zara text-[10px] text-slate-500">Question {qIndex} of 8</p>
-            <div className="mt-3 h-1 w-48 overflow-hidden rounded-full bg-white/10 sm:w-72">
-              <div className="h-full rounded-full bg-blue-400 transition-all" style={{ width: `${progressPct}%` }} />
-            </div>
-          </div>
-          <span className={`status-pill ${statusClass}`}>{statusLabel}</span>
-        </div>
-
-        <section className="flex flex-col items-center text-center">
-          <div className="relative">
-            <div
-              className={`absolute -inset-8 rounded-full border ${
-                agentState === "thinking" ? "border-violet-400/25" : "border-blue-400/20"
-              }`}
-            />
-            <InterviewerAvatar
-              name={interviewer}
-              size="lg"
-              pulse={agentState === "speaking" || agentState === "listening"}
-            />
-          </div>
-
-          <h1 className="mt-10 text-xl font-medium">{interviewer}</h1>
-          <p className="mt-2 text-sm text-slate-400" aria-live="polite">
-            {micHint || statusLabel}
-          </p>
-
-          <div className="mt-6 w-[min(520px,90vw)]">
-            <Waveform
-              active={agentState === "speaking" || agentState === "listening"}
-              thinking={agentState === "thinking"}
-              level={agentState === "listening" ? Math.max(0.2, micLevel) : agentState === "speaking" ? 0.55 : 0.15}
-            />
-          </div>
-
-          <div className="mt-4 min-h-16 max-w-xl text-sm leading-7 text-slate-300">
-            {(partialHeard || question) && (
-              <span className="inline-block rounded-lg border border-white/10 bg-white/[.035] px-4 py-3 text-left">
-                “{partialHeard || question}”
-              </span>
-            )}
-          </div>
-        </section>
-
-        <div className="mt-10 flex flex-col items-center gap-3">
-          <div
-            className={`relative grid size-20 place-items-center rounded-full border transition-transform ${
-              agentState === "listening"
-                ? "border-blue-400/40 bg-blue-500/15 text-blue-200 shadow-[0_0_40px_rgba(59,130,246,.15)]"
-                : "border-white/15 bg-white/[.04] text-slate-400"
-            } ${agentState === "listening" ? "mic-pulse" : ""}`}
-            aria-label="Microphone"
-          >
-            <MicIcon hot={micLevel > 0.04 || agentState === "listening"} />
-          </div>
-          <span className="text-xs text-slate-500">
-            {agentState === "listening"
-              ? "Mic open — speak, then pause ~2s"
-              : agentState === "speaking"
-                ? `${interviewer} is talking`
-                : "Please wait…"}
-          </span>
-        </div>
-
-        {agentState === "listening" && (
-          <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
-            <select
-              className="input max-w-xs text-sm"
-              value={micDeviceId}
-              onChange={(e) => {
-                const id = e.target.value;
-                setMicDeviceId(id);
-                void startLevelMeter(id || undefined).then(() => startListeningRef.current());
-              }}
-            >
-              {micDevices.length === 0 ? (
-                <option value="">Default microphone</option>
-              ) : (
-                micDevices.map((d) => (
-                  <option key={d.deviceId} value={d.deviceId}>
-                    {d.label || `Mic ${d.deviceId.slice(0, 6)}`}
-                  </option>
-                ))
-              )}
-            </select>
-            <select
-              className="input max-w-[9rem] text-sm"
-              value={voiceLang}
-              onChange={(e) => {
-                setVoiceLang(e.target.value as VoiceLang);
-                startListeningRef.current();
-              }}
-            >
-              <option value="en-IN">English (India)</option>
-              <option value="en-US">English (US)</option>
-              <option value="hi-IN">Hindi</option>
-            </select>
-          </div>
-        )}
-
-        <form
-          className="mt-8 w-full max-w-xl"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!answer.trim()) return;
-            submitAnswer(answer);
-            setAnswer("");
-          }}
-        >
-          <textarea
-            ref={answerBoxRef}
-            className="input min-h-20 text-sm"
-            value={answer}
-            onChange={(e) => setAnswer(e.target.value)}
-            placeholder="Text fallback if voice fails…"
-          />
-          <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
-            <button
-              className="btn btn-primary"
-              type="submit"
-              disabled={!answer.trim() || agentState === "thinking"}
-            >
-              Send answer
-            </button>
-            <button type="button" className="btn btn-secondary" onClick={endInterview}>
-              End interview
-            </button>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={() => setTranscriptOpen((v) => !v)}
-            >
-              Transcript
-            </button>
-          </div>
-        </form>
-
-        {aiStatus && !aiStatus.ready && (
-          <p className="mt-4 max-w-md text-center text-xs text-slate-500">
-            Tip: add Groq LLM_API_KEY for Whisper STT + smarter follow-ups.
-          </p>
-        )}
-      </main>
-
-      {transcriptOpen && (
-        <aside className="absolute right-4 top-20 hidden w-72 rounded-lg border border-white/10 bg-[#131720]/95 p-4 shadow-2xl backdrop-blur-sm xl:block">
-          <div className="mb-4 flex items-center justify-between">
-            <p className="text-xs font-medium">Live transcript</p>
-            <span className="font-mono-zara text-[10px] tracking-normal text-emerald-300">LIVE</span>
-          </div>
-          <div className="max-h-[60vh] space-y-4 overflow-y-auto">
-            {transcript.length === 0 ? (
-              <p className="text-xs text-slate-500">Conversation will show here…</p>
-            ) : (
-              transcript.slice(-10).map((t, i) => (
-                <div key={`${i}-${t.content.slice(0, 20)}`}>
-                  <p
-                    className={`font-mono-zara text-[10px] tracking-normal ${
-                      t.role === "interviewer" ? "text-blue-300" : "text-emerald-300"
-                    }`}
-                  >
-                    {t.role === "interviewer" ? interviewer.toUpperCase() : "YOU"}
-                  </p>
-                  <p className="mt-1 text-xs leading-5 text-slate-400">{t.content}</p>
-                </div>
-              ))
-            )}
-          </div>
-        </aside>
-      )}
-
-      {error && (
-        <p className="absolute bottom-4 left-1/2 w-[min(520px,92vw)] -translate-x-1/2 text-center text-sm text-red-300">
-          {error}
-        </p>
-      )}
-    </div>
-  );
+  return null;
 }
 
 function Brand() {
@@ -1393,21 +1677,4 @@ function Brand() {
 
 function Shell({ children }: { children: React.ReactNode }) {
   return <div className="mx-auto min-h-screen max-w-6xl px-6 py-8">{children}</div>;
-}
-
-function MicIcon({ hot }: { hot: boolean }) {
-  return (
-    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path
-        d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z"
-        fill={hot ? "#93c5fd" : "currentColor"}
-      />
-      <path
-        d="M19 11a7 7 0 0 1-14 0M12 18v3"
-        stroke={hot ? "#93c5fd" : "currentColor"}
-        strokeWidth="1.8"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
 }
