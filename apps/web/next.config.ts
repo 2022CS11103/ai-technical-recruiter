@@ -1,9 +1,13 @@
 import type { NextConfig } from "next";
 
-const API_PROXY_TARGET =
+const API_PROXY_TARGET = (
   process.env.API_PROXY_TARGET ||
   process.env.NEXT_PUBLIC_API_URL ||
-  "http://127.0.0.1:8001";
+  "http://127.0.0.1:8001"
+).replace(/\/$/, "");
+
+const isLocalApi =
+  API_PROXY_TARGET.includes("127.0.0.1") || API_PROXY_TARGET.includes("localhost");
 
 const nextConfig: NextConfig = {
   // LLM turns can take >30s; default proxy abort was dropping /answer before TTS/reply.
@@ -16,16 +20,18 @@ const nextConfig: NextConfig = {
     return config;
   },
   async rewrites() {
-    // Same-origin /api/* → FastAPI (local or production API_PROXY_TARGET).
-    const target = API_PROXY_TARGET.replace(/\/$/, "");
+    // Never proxy production traffic to localhost (causes FUNCTION_INVOCATION_FAILED on Vercel).
+    if (process.env.VERCEL && isLocalApi) {
+      return [];
+    }
     return [
       {
         source: "/api/:path*",
-        destination: `${target}/api/:path*`,
+        destination: `${API_PROXY_TARGET}/api/:path*`,
       },
       {
         source: "/health",
-        destination: `${target}/health`,
+        destination: `${API_PROXY_TARGET}/health`,
       },
     ];
   },

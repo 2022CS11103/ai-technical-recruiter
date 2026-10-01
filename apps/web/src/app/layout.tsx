@@ -1,29 +1,20 @@
 import type { Metadata } from "next";
-import { Figtree, Syne } from "next/font/google";
 import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
-
-const syne = Syne({
-  subsets: ["latin"],
-  variable: "--font-display",
-  weight: ["600", "700", "800"],
-});
-
-const figtree = Figtree({
-  subsets: ["latin"],
-  variable: "--font-body",
-  weight: ["400", "500", "600", "700"],
-});
 
 export const metadata: Metadata = {
   title: "ZARA — AI Technical Recruiter",
   description: "Conduct adaptive technical interviews with AI.",
 };
 
+/**
+ * Avoid next/font/google on Vercel — font CDN fetch failures crash SSR
+ * with FUNCTION_INVOCATION_FAILED. System stacks stay reliable.
+ */
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body className={`${syne.variable} ${figtree.variable} antialiased`}>
+      <body className="font-body antialiased">
         {children}
         <Toaster />
       </body>

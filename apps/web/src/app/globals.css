@@ -23,6 +23,10 @@
   --sidebar-accent: rgba(255, 255, 255, 0.06);
   --primary: #3b82f6;
   --primary-foreground: #ffffff;
+
+  /* Stable stacks — no Google Fonts fetch at runtime (Vercel-safe) */
+  --font-body: "Segoe UI", "Helvetica Neue", Arial, ui-sans-serif, system-ui, sans-serif;
+  --font-display: Georgia, "Times New Roman", ui-serif, serif;
 }
 
 @theme inline {

@@ -45,22 +45,30 @@ Health check: `https://YOUR-API.onrender.com/health`
 
 1. Go to [https://vercel.com/new](https://vercel.com/new)
 2. Import the same GitHub repo
-3. Configure project:
+3. Configure project (**critical**):
    - **Framework Preset:** Next.js
-   - **Root Directory:** `apps/web`  ← important
-   - **Build Command:** `npm run build` (default)
-   - **Install Command:** `npm install` (default)
+   - **Root Directory:** `apps/web` ← must click Edit and set this
+   - **Build Command:** `npm run build`
+   - **Install Command:** `npm install`
 4. Environment variables:
 
 | Key | Value |
 |-----|--------|
 | `API_PROXY_TARGET` | `https://YOUR-API.onrender.com` (no trailing slash) |
-| `NEXT_PUBLIC_API_URL` | leave empty for same-origin `/api` proxy, **or** set to the API URL |
+
+> If Root Directory is left as repo root, Vercel will crash with
+> `FUNCTION_INVOCATION_FAILED` / “This page is unavailable”.
 
 5. Deploy
 
 6. After first deploy, update Render `CORS_ORIGINS` to your real Vercel URL
    (and any preview URLs you need), then redeploy API if needed.
+
+### Fixing an already-broken Vercel project
+
+1. Project → **Settings → General → Root Directory** → set `apps/web` → Save
+2. **Settings → Environment Variables** → add `API_PROXY_TARGET` = your API URL
+3. **Deployments → … → Redeploy** (clear cache if available)
 
 ---
 
