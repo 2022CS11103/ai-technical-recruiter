@@ -1562,6 +1562,7 @@ export default function CandidateInterviewPage() {
 
   if (phase === "done") {
     const dossierId = info?.candidate_id;
+    const canOpenDossier = Boolean(dossierId && typeof window !== "undefined" && window.localStorage.getItem("atr_token"));
     return (
       <div className="micro-room grid place-items-center p-5" data-testid="candidate-complete-room">
         <div className="w-full max-w-lg text-center">
@@ -1583,14 +1584,14 @@ export default function CandidateInterviewPage() {
               <span className="text-slate-900">{info?.role || "Technical interview"}</span>
             </div>
           </div>
-          {dossierId ? (
+          {canOpenDossier ? (
             <Link className="micro-cta mt-6 inline-flex w-full justify-center no-underline" href={`/candidates/${dossierId}`}>
               View recruiter dossier
             </Link>
           ) : (
-            <Link className="micro-cta mt-6 inline-flex w-full justify-center no-underline" href="/candidates">
-              Open candidates
-            </Link>
+            <p className="mt-6 text-sm text-slate-500">
+              Your recruiter can open the evidence dossier from their ZARA workspace.
+            </p>
           )}
           <Link className="mt-3 inline-flex w-full justify-center text-sm text-slate-500 hover:text-slate-800" href="/interview/try">
             Back to start

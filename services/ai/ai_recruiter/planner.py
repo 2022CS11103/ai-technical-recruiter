@@ -38,7 +38,63 @@ _JUNK_TOPICS = {
     "intern",
     "responsible",
     "worked",
+    "implemented",
+    "led",
+    "scaled",
+    "reduced",
+    "using",
+    "python",
+    "fastapi",
+    "react",
+    "backend",
+    "frontend",
+    "multi",
+    "stage",
+    "adaptive",
+    "interview",
+    "intervie",
+    "education",
+    "skills",
+    "achievements",
+    "certifications",
+    "summary",
+    "objective",
+    "contact",
+    "technologies",
 }
+
+_VERB_LEAD = re.compile(
+    r"^(built|designed|created|developed|implemented|improved|led|scaled|reduced|"
+    r"worked|using|responsible|helped|managed|owned|wrote|shipped)\b",
+    re.I,
+)
+
+
+def is_project_title(raw: str) -> bool:
+    """True only for short product-like titles (CreatorOS, Improved), not claim fragments."""
+    text = " ".join(str(raw or "").split()).strip(" -:•|,.'\"")
+    if not text:
+        return False
+    lowered = text.lower()
+    words = text.split()
+    # Verb phrases / claim fragments are never titles
+    if _VERB_LEAD.match(text) and len(words) > 1:
+        return False
+    if lowered in _JUNK_TOPICS:
+        return False
+    if len(words) > 4 or len(text) > 40:
+        return False
+    # Reject truncated / mid-sentence leftovers
+    if text.endswith(("…", "...", ",")) or re.search(r"\b(intervie|adaptiv|multi-stage)\b", lowered):
+        return False
+    # Prefer TitleCase / CamelCase / known product shape
+    if any(w.lower() in _JUNK_TOPICS for w in words):
+        return False
+    if re.match(r"^[A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+)?$", text):
+        return len(text) >= 2
+    if re.match(r"^[A-Z][a-zA-Z0-9]*(?:OS|App|System|Platform|Bot|AI)$", text):
+        return True
+    return False
 
 
 def clean_topic_name(raw: str) -> str:
@@ -53,6 +109,10 @@ def clean_topic_name(raw: str) -> str:
         "developed ",
         "designed:",
         "designed ",
+        "improved:",
+        "improved ",
+        "implemented:",
+        "implemented ",
         "project:",
         "projects:",
         "worked on ",
@@ -65,20 +125,29 @@ def clean_topic_name(raw: str) -> str:
             text = text[len(prefix) :].strip(" -:•|,.")
             lowered = text.lower()
             break
-    if not text or lowered in _JUNK_TOPICS or len(text) < 4:
+    if not text or lowered in _JUNK_TOPICS or len(text) < 2:
         return ""
     # Reject claim fragments used as project titles
     if lowered.startswith(("and ", "or ", "to ", "for ", "with ", "in ", "on ", "the ")):
         return ""
-    if "@" in text or text[:1].isdigit() and len(text) < 8:
+    if _VERB_LEAD.match(text):
+        return ""
+    if "@" in text or (text[:1].isdigit() and len(text) < 8):
         return ""
     # Prefer short title-like names; long sentence fragments are claims, not projects
-    if len(text.split()) > 6 or len(text) > 48:
-        # Keep only if it looks like a product name (TitleCase / CamelCase token)
-        tokens = re.findall(r"[A-Z][A-Za-z0-9]{2,}", text)
+    if len(text.split()) > 4 or len(text) > 40:
+        # Keep only a product-like CamelCase token (CreatorOS, TaskQueue)
+        tokens = re.findall(r"\b([A-Z][A-Za-z0-9]*(?:OS|App|System|Platform|Bot|AI)?)\b", text)
+        tokens = [t for t in tokens if t.lower() not in _JUNK_TOPICS and len(t) >= 3]
         if tokens:
             text = tokens[0]
         else:
+            return ""
+    if not is_project_title(text):
+        # Still allow clean short CamelCase / TitleCase singles
+        if not re.match(r"^[A-Z][A-Za-z0-9]{1,30}$", text):
+            return ""
+        if text.lower() in _JUNK_TOPICS:
             return ""
     return text
 

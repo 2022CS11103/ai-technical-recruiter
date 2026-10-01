@@ -42,7 +42,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     api<Overview>("/api/v1/dashboard/overview").then(setOverview).catch(() => setOverview(null));
-    api<ResultRow[]>("/api/v1/dossiers/recent", { auth: false }).then(setRows).catch(() => setRows([]));
+    api<ResultRow[]>("/api/v1/dossiers/recent").then(setRows).catch(() => setRows([]));
   }, []);
 
   const avg10 = overview ? Math.round(((overview.average_score || 0) / 10) * 10) / 10 : 0;

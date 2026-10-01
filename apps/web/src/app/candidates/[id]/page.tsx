@@ -104,7 +104,7 @@ export default function CandidateDetailPage() {
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
-    api<Dossier>(`/api/v1/dossiers/${id}`, { auth: false })
+    api<Dossier>(`/api/v1/dossiers/${id}`)
       .then((data) => {
         if (!cancelled) setDossier(data);
       })

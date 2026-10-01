@@ -63,11 +63,31 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def fill_keys_from_aliases(self):
-        # Allow GROQ_API_KEY / OPENAI_API_KEY as drop-in aliases
+        # Allow GROQ_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY as drop-in aliases
         if not self.llm_api_key:
-            self.llm_api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+            self.llm_api_key = (
+                os.getenv("GROQ_API_KEY")
+                or os.getenv("GEMINI_API_KEY")
+                or os.getenv("GOOGLE_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+                or ""
+            )
+        provider = (self.llm_provider or "groq").strip().lower()
+        if provider in {"gemini", "google", "google-ai"}:
+            if not self.llm_base_url or "groq.com" in self.llm_base_url:
+                self.llm_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            if not self.llm_model or "llama" in self.llm_model:
+                self.llm_model = "gemini-2.0-flash"
+            if not self.llm_fallback_model or "llama" in self.llm_fallback_model:
+                self.llm_fallback_model = "gemini-2.0-flash-lite"
         if not self.stt_api_key:
-            self.stt_api_key = self.llm_api_key or os.getenv("GROQ_API_KEY") or ""
+            # Whisper STT is Groq-hosted; keep Groq key for STT even if LLM is Gemini.
+            self.stt_api_key = (
+                os.getenv("STT_API_KEY")
+                or os.getenv("GROQ_API_KEY")
+                or (self.llm_api_key if provider == "groq" else "")
+                or ""
+            )
         return self
 
     @property

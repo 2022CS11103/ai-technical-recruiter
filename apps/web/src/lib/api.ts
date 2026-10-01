@@ -15,11 +15,21 @@ export function getToken(): string | null {
 
 export function setToken(token: string) {
   localStorage.setItem("atr_token", token);
+  try {
+    document.cookie = `atr_token=${encodeURIComponent(token)}; path=/; max-age=${60 * 60 * 24 * 7}; SameSite=Lax`;
+  } catch {
+    /* ignore */
+  }
 }
 
 export function clearToken() {
   localStorage.removeItem("atr_token");
   localStorage.removeItem("atr_role");
+  try {
+    document.cookie = "atr_token=; path=/; max-age=0; SameSite=Lax";
+  } catch {
+    /* ignore */
+  }
 }
 
 export function setRole(role: string) {

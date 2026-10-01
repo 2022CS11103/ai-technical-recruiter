@@ -67,20 +67,43 @@ def _merge_resume_with_text(parsed: ResumeProfile, heuristic: ResumeProfile, tex
 
 
 async def analyze_jd(llm: LLMProvider, text: str) -> JobProfileExtract:
+    heuristic = _heuristic_jd(text)
     if isinstance(llm, MockLLM):
-        return _heuristic_jd(text)
+        return heuristic
     system, version = get_prompt("jd_analyzer")
     try:
-        return await llm.structured_output(
+        parsed = await llm.structured_output(
             [
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"Analyze this job description:\n\n{text[:12000]}"},
+                {
+                    "role": "user",
+                    "content": (
+                        "Analyze this job description. "
+                        "Use the EXACT role title written in the JD "
+                        "(e.g. Machine Learning Engineer) — do not default to AI Engineer.\n\n"
+                        f"{text[:12000]}"
+                    ),
+                },
             ],
             JobProfileExtract,
             meta={"prompt_name": "jd_analyzer", "prompt_version": version},
         )
     except Exception:
-        return _heuristic_jd(text)
+        return heuristic
+
+    data = parsed.model_dump()
+    text_l = text.lower()
+    llm_title = (parsed.title or "").strip()
+    heur_title = (heuristic.title or "").strip()
+    # Prefer a title that actually appears in the JD text.
+    if heur_title and heur_title.lower() != "technical role":
+        if not llm_title or llm_title.lower() not in text_l:
+            data["title"] = heur_title
+        elif heur_title.lower() in text_l and len(heur_title) >= len(llm_title):
+            data["title"] = heur_title
+    elif not llm_title:
+        data["title"] = heur_title or "Technical Role"
+    return JobProfileExtract.model_validate(data)
 
 
 async def match_resume_jd(
@@ -170,12 +193,71 @@ def _heuristic_resume(text: str) -> ResumeProfile:
         if re.search(r"\b\d+(\.\d+)?\s*%|\b\d+x\b|\b(latency|throughput|users|qps|ms|seconds)\b", ln, re.I):
             metrics.append(ln[:160])
     projects = []
-    for c in claims[:5]:
-        proj = re.search(r"\b([A-Z][A-Za-z0-9]+(?:OS|App|System|Platform|Bot|AI)?)\b", c)
-        pname = proj.group(1) if proj else ""
-        if pname.lower() in {"built", "designed", "created", "developed", "python", "fastapi"}:
-            pname = ""
-        projects.append({"name": pname or c[:40], "description": c, "tech": [s for s in skills if s.lower() in c.lower()]})
+    # Prefer explicit product-like names in the resume (CreatorOS, TaskQueue, …)
+    for m in re.finditer(
+        r"\b([A-Z][A-Za-z0-9]*(?:OS|App|System|Platform|Bot)|[A-Z][a-z]+[A-Z][A-Za-z0-9]+)\b",
+        text,
+    ):
+        pname = m.group(1)
+        if pname.lower() in {
+            "built",
+            "designed",
+            "created",
+            "developed",
+            "python",
+            "fastapi",
+            "react",
+            "improved",
+            "implemented",
+        }:
+            continue
+        if pname.lower() not in {str(p.get("name", "")).lower() for p in projects}:
+            # Capture nearby line as description
+            idx = text.find(pname)
+            snippet = text[max(0, idx - 20) : idx + 160].replace("\n", " ").strip()
+            projects.append(
+                {
+                    "name": pname,
+                    "description": snippet[:200],
+                    "tech": [s for s in skills if s.lower() in snippet.lower()],
+                }
+            )
+        if len(projects) >= 5:
+            break
+    # Fallback: titled lines "Name — description"
+    if not projects:
+        for ln in lines:
+            titled = re.match(
+                r"^([A-Z][A-Za-z0-9][A-Za-z0-9 ._-]{1,30}?)\s*(?:[—\-|:•]|–)\s+(.+)$",
+                ln.strip(),
+            )
+            if not titled:
+                continue
+            pname = titled.group(1).strip()
+            if pname.lower() in {"built", "designed", "created", "developed", "python"}:
+                continue
+            projects.append(
+                {
+                    "name": pname,
+                    "description": titled.group(2)[:200],
+                    "tech": [s for s in skills if s.lower() in ln.lower()],
+                }
+            )
+            if len(projects) >= 5:
+                break
+    # Last resort: claims with an embedded product token only (never claim[:40] as name)
+    if not projects:
+        for c in claims[:5]:
+            proj = re.search(
+                r"\b([A-Z][A-Za-z0-9]+(?:OS|App|System|Platform|Bot)|[A-Z][a-z]+[A-Z][A-Za-z0-9]+)\b",
+                c,
+            )
+            pname = proj.group(1) if proj else ""
+            if not pname or pname.lower() in {"built", "designed", "created", "developed", "python", "fastapi", "improved"}:
+                continue
+            projects.append({"name": pname, "description": c, "tech": [s for s in skills if s.lower() in c.lower()]})
+            if len(projects) >= 5:
+                break
     return ResumeProfile(
         candidate_name=name,
         email=email_m.group(0) if email_m else "",
@@ -192,6 +274,75 @@ def _heuristic_resume(text: str) -> ResumeProfile:
     )
 
 
+def _extract_job_title(text: str) -> str:
+    """Prefer the title written in the JD — never force 'AI Engineer'."""
+    # Explicit labeled lines (highest priority)
+    for pattern in (
+        r"(?im)^(?:job\s*title|title|role|position)\s*[:\-]\s*(.+)$",
+        r"(?im)^we(?:'re| are)\s+hiring\s+(?:a|an)\s+(.+?)(?:\.|$)",
+        r"(?im)^hiring\s*[:\-]\s*(.+)$",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            title = m.group(1).strip(" -\t•*|.,")
+            title = re.split(r"[|\n(]", title)[0].strip()
+            # Ignore generic labels pasted as the value
+            if 3 <= len(title) <= 80 and title.lower() not in {"role", "title", "position"}:
+                return title
+
+    # Heading like "Machine Learning Engineer — Job Description"
+    first = (text.strip().splitlines() or [""])[0].strip()
+    head = re.match(
+        r"^(.+?)\s*[—\-–|:]\s*(?:job\s*description|jd|role|position)\b",
+        first,
+        re.I,
+    )
+    if head:
+        title = head.group(1).strip(" -\t•*|.,")
+        if 3 <= len(title) <= 80:
+            return title
+
+    # Common role phrases — longest / most specific first
+    role_patterns = [
+        r"\bMachine Learning Engineer\b",
+        r"\bML Engineer\b",
+        r"\bData Scientist\b",
+        r"\bData Engineer\b",
+        r"\bSoftware Engineer\b",
+        r"\bFull[- ]?Stack Engineer\b",
+        r"\bBackend Engineer\b",
+        r"\bFrontend Engineer\b",
+        r"\bPlatform Engineer\b",
+        r"\bDevOps Engineer\b",
+        r"\bMLOps Engineer\b",
+        r"\bResearch Engineer\b",
+        r"\bApplied Scientist\b",
+        r"\bAI Engineer\b",
+    ]
+    for pat in role_patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            raw = m.group(0)
+            parts = []
+            for w in raw.split():
+                low = w.lower()
+                if low == "ml":
+                    parts.append("ML")
+                elif low == "ai":
+                    parts.append("AI")
+                else:
+                    parts.append(w.capitalize())
+            return " ".join(parts)
+
+    # First non-empty line if it looks like a title
+    for ln in text.splitlines()[:8]:
+        stripped = ln.strip(" -\t•*|")
+        if 4 <= len(stripped) <= 60 and re.search(r"\b(engineer|scientist|developer|analyst)\b", stripped, re.I):
+            if not re.search(r"\b(we|our|you|responsibilities|requirements|looking)\b", stripped, re.I):
+                return re.split(r"[—\-–|:]", stripped)[0].strip()
+    return "Technical Role"
+
+
 def _heuristic_jd(text: str) -> JobProfileExtract:
     skills_known = [
         "Python",
@@ -204,14 +355,14 @@ def _heuristic_jd(text: str) -> JobProfileExtract:
         "Kafka",
         "LangGraph",
         "System Design",
+        "Machine Learning",
+        "PyTorch",
+        "TensorFlow",
+        "NLP",
+        "Computer Vision",
     ]
     required = [s for s in skills_known if re.search(rf"\b{re.escape(s)}\b", text, re.I)]
-    title_m = re.search(r"(?im)^(?:job\s*title|role)\s*[:\-]\s*(.+)$", text)
-    title = title_m.group(1).strip() if title_m else "Technical Role"
-    if re.search(r"\bAI Engineer\b", text, re.I):
-        title = "AI Engineer"
-    elif re.search(r"\bBackend Engineer\b", text, re.I):
-        title = "Backend Engineer"
+    title = _extract_job_title(text)
     seniority = "mid"
     if re.search(r"\b(senior|staff|principal)\b", text, re.I):
         seniority = "senior"
@@ -224,7 +375,7 @@ def _heuristic_jd(text: str) -> JobProfileExtract:
     return JobProfileExtract(
         title=title,
         required_skills=required or ["Python"],
-        preferred_skills=[s for s in ["Kubernetes", "Kafka"] if s.lower() in text.lower()],
+        preferred_skills=[s for s in ["Kubernetes", "Kafka", "PyTorch"] if s.lower() in text.lower()],
         experience=experience,
         seniority=seniority,
         responsibilities=[ln.strip("-• ") for ln in text.splitlines() if ln.strip().startswith(("-", "•"))][:8],

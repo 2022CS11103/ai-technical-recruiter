@@ -85,7 +85,10 @@ async def ai_status():
         "ready": bool(s.llm_api_key),
         "hint": None
         if s.llm_api_key
-        else "Add LLM_API_KEY (Groq) to apps/api/.env and restart the API",
+        else "Add GROQ_API_KEY or GEMINI_API_KEY to apps/api/.env and restart the API",
+        "stt_hint": None
+        if (s.stt_api_key or (s.llm_provider == "groq" and s.llm_api_key))
+        else "Whisper STT needs a Groq key (STT_API_KEY or GROQ_API_KEY). Browser speech works without it.",
     }
 
 

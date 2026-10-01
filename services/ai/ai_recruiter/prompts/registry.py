@@ -9,10 +9,12 @@ PROMPTS: dict[str, dict[str, str]] = {
         ),
     },
     "jd_analyzer": {
-        "version": "v1",
+        "version": "v2",
         "system": (
             "You analyze job descriptions for technical roles. "
-            "Extract title, skills, experience, responsibilities, competencies. JSON only."
+            "Extract the EXACT job title as written in the JD "
+            "(e.g. Machine Learning Engineer, Backend Engineer) — never invent or default to AI Engineer. "
+            "Also extract skills, experience, responsibilities, competencies. JSON only."
         ),
     },
     "candidate_jd_matcher": {

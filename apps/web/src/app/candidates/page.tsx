@@ -39,7 +39,7 @@ export default function CandidatesPage() {
 
   useEffect(() => {
     let cancelled = false;
-    api<LiveCandidate[]>("/api/v1/dossiers/recent", { auth: false })
+    api<LiveCandidate[]>("/api/v1/dossiers/recent")
       .then((data) => {
         if (!cancelled) setRows(Array.isArray(data) ? data : []);
       })

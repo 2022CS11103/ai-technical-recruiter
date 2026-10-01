@@ -37,6 +37,7 @@ from app.models import (
     Recommendation,
     ResumeJdMatch,
     User,
+    UserRole,
 )
 from app.schemas import AnswerIn, ConsentIn, InterviewCreate, InterviewOut, OverviewStats, ReportOverride
 from app.services.ai_factory import get_stt, get_tts, get_tts_for_interviewer, make_agent
@@ -462,10 +463,15 @@ async def self_serve_interview(
     db: Annotated[AsyncSession, Depends(get_db)],
     authorization: Annotated[Optional[str], Header()] = None,
 ):
-    """Candidate opens interview by pasting JD + resume. No recruiter login required."""
+    """Candidate opens interview by pasting JD + resume. No recruiter login required.
+
+    If a recruiter JWT is present, attach the session to their company so results
+    show up in their dashboard.
+    """
     from ai_recruiter import analyze_jd, match_resume_jd, parse_resume
     from app.services.ai_factory import get_llm
     from uuid import uuid4
+    from app.core.security import safe_decode_token
 
     jd_text = (payload.get("jd_text") or "").strip()
     resume_text = (payload.get("resume_text") or "").strip()
@@ -476,12 +482,37 @@ async def self_serve_interview(
     if not jd_text or not resume_text:
         raise HTTPException(status_code=400, detail="Both job description and resume are required")
 
-    company = Company(name="Self-Serve Interview", slug=f"self-{uuid4().hex[:8]}")
-    db.add(company)
-    await db.flush()
+    company: Company | None = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        payload_tok = safe_decode_token(token)
+        if payload_tok and payload_tok.get("sub"):
+            try:
+                uid = uuid.UUID(str(payload_tok["sub"]))
+            except ValueError:
+                uid = None
+            if uid:
+                user = await db.get(User, uid)
+                if user and user.role in (UserRole.recruiter, UserRole.admin):
+                    try:
+                        company_id = await get_user_company_id(user, db)
+                        company = await db.get(Company, company_id)
+                    except Exception:
+                        company = None
+
+    if company is None:
+        company = Company(name="Self-Serve Interview", slug=f"self-{uuid4().hex[:8]}")
+        db.add(company)
+        await db.flush()
 
     llm = get_llm()
     jd = await analyze_jd(llm, jd_text)
+    # Hard-lock title to what the JD actually says (Role: / heading), not body fluff.
+    from ai_recruiter.parsing import _extract_job_title
+
+    locked_title = _extract_job_title(jd_text)
+    if locked_title and locked_title.lower() not in {"technical role", "role"}:
+        jd.title = locked_title
     resume = await parse_resume(llm, resume_text)
     # Always prefer a name literally present in the pasted resume text
     from ai_recruiter.parsing import _extract_person_name
@@ -1177,10 +1208,19 @@ async def _build_dossier(db: AsyncSession, session: InterviewSession) -> dict[st
 
 
 @router.get("/dossiers/recent")
-async def list_recent_dossiers(db: Annotated[AsyncSession, Depends(get_db)]):
-    """Live sessions for the recruiter UI (includes self-serve interviews)."""
+async def list_recent_dossiers(
+    user: Annotated[User, Depends(require_recruiter)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Tenant-scoped sessions for the recruiter results UI."""
+    company_id = await get_user_company_id(user, db)
     sessions = (
-        await db.execute(select(InterviewSession).order_by(InterviewSession.created_at.desc()).limit(30))
+        await db.execute(
+            select(InterviewSession)
+            .where(InterviewSession.company_id == company_id)
+            .order_by(InterviewSession.created_at.desc())
+            .limit(30)
+        )
     ).scalars().all()
     rows = []
     for session in sessions:
@@ -1201,11 +1241,19 @@ async def list_recent_dossiers(db: Annotated[AsyncSession, Depends(get_db)]):
 
 
 @router.get("/dossiers/{candidate_id}")
-async def get_dossier(candidate_id: uuid.UUID, db: Annotated[AsyncSession, Depends(get_db)]):
+async def get_dossier(
+    candidate_id: uuid.UUID,
+    user: Annotated[User, Depends(require_recruiter)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    company_id = await get_user_company_id(user, db)
     session = (
         await db.execute(
             select(InterviewSession)
-            .where(InterviewSession.candidate_id == candidate_id)
+            .where(
+                InterviewSession.candidate_id == candidate_id,
+                InterviewSession.company_id == company_id,
+            )
             .order_by(InterviewSession.created_at.desc())
         )
     ).scalars().first()

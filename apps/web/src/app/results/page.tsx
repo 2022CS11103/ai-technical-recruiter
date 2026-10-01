@@ -23,7 +23,7 @@ export default function InterviewResultsPage() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    api<Row[]>("/api/v1/dossiers/recent", { auth: false })
+    api<Row[]>("/api/v1/dossiers/recent")
       .then(setRows)
       .catch((e) => setError(e instanceof Error ? e.message : "Could not load results"));
   }, []);

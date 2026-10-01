@@ -316,7 +316,26 @@ def _mock_report() -> dict[str, Any]:
 def build_llm(provider: str, api_key: str, base_url: str, model: str, fallback: str) -> LLMProvider:
     if not api_key or provider == "mock":
         return MockLLM()
-    return OpenAICompatibleLLM(api_key=api_key, base_url=base_url, model=model, fallback_model=fallback)
+    key = (provider or "groq").strip().lower()
+    # Free-tier friendly presets (OpenAI-compatible HTTP).
+    if key in {"gemini", "google", "google-ai"}:
+        base_url = base_url or "https://generativelanguage.googleapis.com/v1beta/openai/"
+        model = model or "gemini-2.0-flash"
+        fallback = fallback or "gemini-2.0-flash-lite"
+    elif key in {"groq"}:
+        base_url = base_url or "https://api.groq.com/openai/v1"
+        model = model or "llama-3.3-70b-versatile"
+        fallback = fallback or "llama-3.1-8b-instant"
+    elif key in {"openai"}:
+        base_url = base_url or "https://api.openai.com/v1"
+        model = model or "gpt-4o-mini"
+        fallback = fallback or model
+    return OpenAICompatibleLLM(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        fallback_model=fallback,
+    )
 
 
 def stable_hash(text: str) -> str:

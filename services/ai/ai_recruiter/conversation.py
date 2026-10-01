@@ -17,7 +17,25 @@ from ai_recruiter.evaluator import (
     topic_key,
     update_memory_summary,
 )
-from ai_recruiter.planner import build_interview_plan, clean_topic_name, heuristic_plan
+from ai_recruiter.planner import build_interview_plan, clean_topic_name, heuristic_plan, is_project_title
+
+# Verb-led claim lines must never become project titles.
+_VERB_LINE = re.compile(
+    r"^(built|designed|created|developed|implemented|improved|led|scaled|reduced|"
+    r"worked|using|responsible|helped|managed|owned|wrote|shipped)\b",
+    re.I,
+)
+_SECTION_WORDS = {
+    "projects",
+    "project",
+    "experience",
+    "education",
+    "skills",
+    "summary",
+    "objective",
+    "built",
+    "designed",
+}
 from ai_recruiter.prompts.registry import get_prompt
 from ai_recruiter.providers.llm import LLMProvider
 from ai_recruiter.schemas import (
@@ -160,7 +178,15 @@ class ConversationManager:
         )
 
         name = context.get("interviewer_name") or "Sarah"
-        role = context.get("job_title") or "role"
+        role = (context.get("job_title") or "").strip() or "role"
+        # Always prefer the title written in the JD text over a stale/generic DB title.
+        jd_text = context.get("jd_text") or ""
+        if jd_text:
+            from ai_recruiter.parsing import _extract_job_title
+
+            extracted = _extract_job_title(jd_text)
+            if extracted and extracted.lower() not in {"", "technical role", "role"}:
+                role = extracted
         candidate = (context.get("candidate_name") or "").strip()
         first = candidate.split()[0].title() if candidate else "there"
         intro = (
@@ -192,26 +218,13 @@ class ConversationManager:
             state.conversation_history.append({"role": "interviewer", "content": reply})
             return state, reply, {"action": "AWAIT_ANSWER", "pinned_question": q}
 
-        # Hard early path: "which project?" — always name resume projects when available.
+        # Hard early path: "which project?" — answer with ONLY a clean project title.
         if _is_scope_clarification(answer):
             reply = _clarify_with_resume(state, answer, context)
             names = _resume_project_names(context, state)
-            # Never answer without names if we can recover them.
-            if names and not any(n.lower() in reply.lower() for n in names[:3]):
-                shown = ", ".join(names[:3])
-                current = clean_topic_name(state.current_project or "")
-                if current:
-                    reply = (
-                        f"I meant your {current} project from your resume. "
-                        f"Other options I see: {shown}. "
-                        "Walk me through the problem, what you built, and what you owned."
-                    )
-                else:
-                    reply = (
-                        f"From your resume I see {shown}. "
-                        "Which one should we dig into — problem, your role, and the tech?"
-                    )
             if names and not state.current_project:
+                state.current_project = names[0]
+            elif names and not is_project_title(state.current_project or ""):
                 state.current_project = names[0]
             state.flags.append("CLARIFY_SCOPE")
             state.last_question = reply
@@ -732,7 +745,7 @@ class ConversationManager:
 
 
 def _resume_project_names(context: dict[str, Any], state: InterviewState | None = None) -> list[str]:
-    """Best-effort project titles from profile, plan, match, and raw resume text."""
+    """Best-effort clean project titles only — never claim fragments."""
     names: list[str] = []
 
     def _add(raw: Any) -> None:
@@ -740,7 +753,9 @@ def _resume_project_names(context: dict[str, Any], state: InterviewState | None 
             item = clean_topic_name(str(raw.get("name") or raw.get("title") or ""))
         else:
             item = clean_topic_name(str(raw or ""))
-        if item and item.lower() not in {c.lower() for c in names}:
+        if not item or not is_project_title(item):
+            return
+        if item.lower() not in {c.lower() for c in names}:
             names.append(item)
 
     if state:
@@ -766,38 +781,38 @@ def _resume_project_names(context: dict[str, Any], state: InterviewState | None 
     for p in (context.get("interview_plan") or {}).get("projects") or []:
         _add(p)
 
-    if len(names) < 2:
-        text = context.get("resume_text") or ""
-        # Prefer an explicit Projects section when present.
-        section = ""
-        m = re.search(
-            r"(?is)(?:^|\n)\s*projects?\s*(?:\n|:)\s*(.*?)(?=\n\s*(?:experience|education|skills|work|internships?|achievements|certifications)\b|\Z)",
-            text,
+    # Always scan resume text for product-like titles (CreatorOS, FooApp, …)
+    text = context.get("resume_text") or ""
+    for m in re.finditer(
+        r"\b([A-Z][A-Za-z0-9]*(?:OS|App|System|Platform|Bot)|[A-Z][a-z]+[A-Z][A-Za-z0-9]+)\b",
+        text,
+    ):
+        token = m.group(1)
+        if token.lower() in _SECTION_WORDS or _VERB_LINE.match(token):
+            continue
+        _add(token)
+
+    section = ""
+    m = re.search(
+        r"(?is)(?:^|\n)\s*projects?\s*(?:\n|:)\s*(.*?)(?=\n\s*(?:experience|education|skills|work|internships?|achievements|certifications)\b|\Z)",
+        text,
+    )
+    if m:
+        section = m.group(1)
+    for line in (section or "").splitlines():
+        stripped = line.strip(" -\t•*|")
+        if not stripped or _VERB_LINE.match(stripped):
+            continue
+        titled = re.match(
+            r"^([A-Z][A-Za-z0-9][A-Za-z0-9 ._-]{0,30}?)\s*(?:[—\-|:•]|–)\s+",
+            stripped,
         )
-        if m:
-            section = m.group(1)
-        scan = section or text
-        for line in scan.splitlines():
-            stripped = line.strip(" -\t•*|")
-            if not stripped or len(stripped) < 3:
-                continue
-            low = stripped.lower()
-            if low.startswith(("technologies", "tech stack", "tools", "skills")):
-                continue
-            # "Improved — RAG chat" / "CreatorOS | FastAPI"
-            titled = re.match(
-                r"^([A-Z][A-Za-z0-9][A-Za-z0-9 ._-]{1,40}?)\s*(?:[—\-|:•]|–)\s+",
-                stripped,
-            )
-            if titled:
-                _add(titled.group(1))
-                continue
-            # Standalone TitleCase / CamelCase product-ish names
-            alone = re.match(r"^([A-Z][A-Za-z0-9]+(?:OS|App|System|Platform|Bot|AI)?)\b", stripped)
-            if alone and len(stripped.split()) <= 6:
-                _add(alone.group(1))
-            if len(names) >= 5:
-                break
+        if titled:
+            _add(titled.group(1))
+        elif re.match(r"^[A-Z][A-Za-z0-9]*(?:OS|App|System|Platform|Bot)?\b", stripped) and len(stripped.split()) <= 3:
+            first = stripped.split()[0]
+            if first.lower() not in _SECTION_WORDS and not _VERB_LINE.match(first):
+                _add(first)
 
     return names[:5]
 
@@ -805,7 +820,7 @@ def _resume_project_names(context: dict[str, Any], state: InterviewState | None 
 def _pick_project(context: dict[str, Any], state: InterviewState | None = None) -> str:
     if state and (state.current_project or "").strip():
         cur = clean_topic_name(state.current_project)
-        if cur:
+        if cur and is_project_title(cur):
             return cur
     names = _resume_project_names(context, state)
     if not names:
@@ -815,47 +830,32 @@ def _pick_project(context: dict[str, Any], state: InterviewState | None = None) 
 
 
 def _clarify_with_resume(state: InterviewState, answer: str, context: dict[str, Any]) -> str:
-    """Always name resume projects when the candidate asks 'which project?'."""
-    wants_choice = any(
-        x in answer.lower()
-        for x in ("free will", "any project", "any one", "my choice", "i pick", "i choose", "whichever")
-    )
+    """Short answer: only the project name — e.g. 'From your CreatorOS project …'."""
     names = _resume_project_names(context, state)
     current = clean_topic_name(state.current_project or "")
-    if current and current not in names:
-        names = [current, *[n for n in names if n.lower() != current.lower()]]
+    if current and not is_project_title(current):
+        current = ""
+    if current and current.lower() not in {n.lower() for n in names}:
+        names = [current, *names]
 
-    # If we were already probing a named project, pin it explicitly.
-    if current and not wants_choice:
-        others = [n for n in names if n.lower() != current.lower()][:2]
-        if others:
+    primary = current or (names[0] if names else "")
+    if primary:
+        # Keep state aligned with the name we speak
+        state.current_project = primary
+        alt = next((n for n in names if n.lower() != primary.lower()), "")
+        if alt:
             return (
-                f"I meant your {current} project from your resume. "
-                f"If you’d rather talk about {', '.join(others)}, say which one — "
-                "otherwise walk me through the problem, what you built, and what you owned."
+                f"From your {primary} project — or say if you meant {alt}. "
+                "Walk me through what you built and what you owned."
             )
         return (
-            f"I meant your {current} project from your resume. "
-            "Walk me through the problem, what you built, and what you owned."
+            f"From your {primary} project — "
+            "walk me through what you built and what you owned."
         )
 
-    if names:
-        shown = ", ".join(names[:3])
-        if wants_choice:
-            return (
-                f"Sure — your call. From your resume I see {shown}. "
-                "Pick one and walk me through the problem, what you built, and what you owned."
-            )
-        return (
-            f"Good question — from your resume I see {shown}. "
-            "Which one should we dig into? Tell me the problem, your role, and the tech."
-        )
-
-    skills = context.get("resume_skills") or (context.get("match") or {}).get("strong_matches") or []
-    skill = skills[0] if skills else "your core stack"
     return (
-        f"Pick any project from your resume you’re proud of, ideally involving {skill}. "
-        "What problem it solved, what you built, and what you owned."
+        "Pick any project from your resume by name. "
+        "Walk me through what you built and what you owned."
     )
 
 

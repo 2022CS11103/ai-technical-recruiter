@@ -182,13 +182,13 @@ export function MicroInterviewRoom({
             <h1 className="micro-brief-title">Before starting the interview,</h1>
             <ol className="micro-brief-list">
               <li>
-                This session is recorded and shared with recruiters as an evidence-based dossier — not a vibe score.
+                This is a practice interview. Your answers are saved as an evidence-based dossier — not a vibe score.
               </li>
               <li>
-                Stay on this tab. Leaving or switching away may be flagged by the proctoring checks.
+                Speak naturally. You can ask clarifying questions anytime, or say you don’t know and we’ll move on.
               </li>
               <li>
-                Ask clarifying questions anytime. Prefer not to repeat the question out loud into the mic.
+                Prefer not to repeat the question out loud into the mic — that can confuse speech recognition.
               </li>
               <li>
                 Pause ~2 seconds when you finish an answer — {interviewer} will continue to the next question.

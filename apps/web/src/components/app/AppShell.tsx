@@ -20,10 +20,11 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { clearToken } from "@/lib/api";
+import { AuthGate } from "@/components/app/AuthGate";
 
 const nav = [
   { label: "Overview", href: "/dashboard", icon: LayoutDashboard },
-  { label: "Interview builder", href: "/interviews/new", icon: BriefcaseBusiness },
+  { label: "Create job", href: "/jobs/new", icon: BriefcaseBusiness },
   { label: "Interview results", href: "/results", icon: FileBarChart },
   { label: "Candidates", href: "/candidates", icon: Users },
   { label: "AI Interviewers", href: "/ai-interviewers", icon: PanelLeftClose },
@@ -43,6 +44,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     href === "/dashboard" ? pathname === href : pathname.startsWith(href);
 
   return (
+    <AuthGate allowRoles={["recruiter", "admin"]}>
     <div className="min-h-svh bg-background text-foreground" data-testid="recruiter-app-shell">
       <aside
         className={`fixed inset-y-0 left-0 z-40 hidden flex-col border-r border-border bg-sidebar transition-[width] duration-200 lg:flex ${
@@ -197,5 +199,6 @@ export function AppShell({ children }: { children: ReactNode }) {
         {children}
       </main>
     </div>
+    </AuthGate>
   );
 }
