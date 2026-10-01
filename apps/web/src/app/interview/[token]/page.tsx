@@ -280,11 +280,8 @@ export default function CandidateInterviewPage() {
   const [spokenDisplay, setSpokenDisplay] = useState("");
   const [topicLabel, setTopicLabel] = useState<string | null>(null);
   const [partialHeard, setPartialHeard] = useState("");
-  const [lastAnswer, setLastAnswer] = useState("");
   const [micHint, setMicHint] = useState("Mic idle");
   const [micLevel, setMicLevel] = useState(0);
-  const [micReady, setMicReady] = useState(false);
-  const [answer, setAnswer] = useState("");
   const [transcript, setTranscript] = useState<Array<{ role: string; content: string }>>([]);
   const [secondsLeft, setSecondsLeft] = useState(30 * 60);
   const [error, setError] = useState("");
@@ -302,7 +299,6 @@ export default function CandidateInterviewPage() {
     ready: boolean;
     hint?: string | null;
   } | null>(null);
-  const answerBoxRef = useRef<HTMLTextAreaElement | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
@@ -434,7 +430,6 @@ export default function CandidateInterviewPage() {
       stopMicMeter();
       try {
         if (!navigator.mediaDevices?.getUserMedia) {
-          setMicReady(false);
           setMicHint("No mic API — use Chrome for voice");
           return null;
         }
@@ -481,7 +476,6 @@ export default function CandidateInterviewPage() {
         const AC = window.AudioContext || (window as SpeechWindow).webkitAudioContext;
         if (!AC) {
           setMicHint("AudioContext unavailable in this browser");
-          setMicReady(true);
           return stream;
         }
         const ctx = new AC();
@@ -516,10 +510,8 @@ export default function CandidateInterviewPage() {
           micRafRef.current = requestAnimationFrame(tick);
         };
         tick();
-        setMicReady(true);
         return stream;
       } catch (e) {
-        setMicReady(false);
         const msg = e instanceof Error ? e.message : "mic error";
         setMicHint(`Mic blocked (${msg}) — allow microphone in the address bar`);
         setError("Allow microphone for this site, then refresh and start again.");
@@ -819,7 +811,6 @@ export default function CandidateInterviewPage() {
       answerBufferRef.current = "";
       lastHeardRef.current = "";
       setPartialHeard("");
-      setLastAnswer(text.trim());
       setMicHint("Answer sent — waiting for reply");
       setTranscript((t) => [...t, { role: "candidate", content: text }]);
       setAgentState("thinking");
@@ -1018,7 +1009,6 @@ export default function CandidateInterviewPage() {
           }
         };
         recorder.start();
-        setMicReady(true);
 
         const armVadCommit = () => {
           if (vadTimerRef.current) clearTimeout(vadTimerRef.current);
@@ -1114,7 +1104,6 @@ export default function CandidateInterviewPage() {
     };
     try {
       recognition.start();
-      setMicReady(true);
     } catch {
       setMicHint("Could not open mic — type your answer below");
       listeningRef.current = false;
