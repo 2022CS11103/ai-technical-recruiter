@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
-const API_PROXY_TARGET = process.env.API_PROXY_TARGET || "http://127.0.0.1:8001";
+const API_PROXY_TARGET =
+  process.env.API_PROXY_TARGET ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  "http://127.0.0.1:8001";
 
 const nextConfig: NextConfig = {
   // LLM turns can take >30s; default proxy abort was dropping /answer before TTS/reply.
@@ -13,15 +16,16 @@ const nextConfig: NextConfig = {
     return config;
   },
   async rewrites() {
-    // Same-origin /api/* → FastAPI. Fixes Cursor/browser "Failed to fetch" to :8001.
+    // Same-origin /api/* → FastAPI (local or production API_PROXY_TARGET).
+    const target = API_PROXY_TARGET.replace(/\/$/, "");
     return [
       {
         source: "/api/:path*",
-        destination: `${API_PROXY_TARGET}/api/:path*`,
+        destination: `${target}/api/:path*`,
       },
       {
         source: "/health",
-        destination: `${API_PROXY_TARGET}/health`,
+        destination: `${target}/health`,
       },
     ];
   },

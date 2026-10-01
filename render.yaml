@@ -1,0 +1,34 @@
+# Optional Render Blueprint — https://render.com/docs/blueprint-spec
+# Deploy: New → Blueprint → connect this repo
+
+services:
+  - type: web
+    name: zara-api
+    runtime: docker
+    dockerfilePath: ./infrastructure/Dockerfile.api
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: LLM_PROVIDER
+        value: groq
+      - key: LLM_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: STT_PROVIDER
+        value: groq
+      - key: STT_API_KEY
+        sync: false
+      - key: TTS_PROVIDER
+        value: edge
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:///./ai_recruiter.db
+      - key: CORS_ORIGINS
+        sync: false
+      - key: PUBLIC_API_URL
+        sync: false
