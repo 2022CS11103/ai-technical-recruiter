@@ -191,7 +191,10 @@ export function MicroInterviewRoom({
                 Prefer not to repeat the question out loud into the mic — that can confuse speech recognition.
               </li>
               <li>
-                Pause ~2 seconds when you finish an answer — {interviewer} will continue to the next question.
+                Pause ~3 seconds when you finish an answer — {interviewer} will continue to the next question.
+              </li>
+              <li>
+                If you speak while {interviewer} is talking, they will stop and listen to you.
               </li>
             </ol>
             {role && <p className="micro-brief-role">Role: {role}</p>}

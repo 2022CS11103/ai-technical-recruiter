@@ -163,7 +163,14 @@ function isSubstantiveAnswer(text: string): boolean {
   return content.length >= 3;
 }
 
-const SILENCE_MS = 2800;
+const SILENCE_MS = 3000;
+/** Ignore tiny mid-sentence pauses until the candidate has spoken at least this long. */
+const MIN_SPEECH_BEFORE_COMMIT_MS = 1200;
+/** Ignore mic spikes for this long after TTS starts (speaker→mic echo). */
+const BARGE_IN_GRACE_MS = 1000;
+/** Sustained loudness required to interrupt the AI. */
+const BARGE_IN_HOLD_MS = 400;
+const BARGE_IN_LEVEL = 0.16;
 /** Survives React Strict Mode remounts so greeting TTS only plays once per token. */
 const liveStartedTokens = new Set<string>();
 /** Tokens where mic was already opened after greeting (avoid double open on remount). */
@@ -318,6 +325,7 @@ export default function CandidateInterviewPage() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const speechStartedRef = useRef(false);
+  const speechStartedAtRef = useRef(0);
   const vadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tokenRef = useRef(token);
   tokenRef.current = token;
@@ -450,7 +458,12 @@ export default function CandidateInterviewPage() {
           micAnalyserRef.current = null;
 
           const constraints: MediaStreamConstraints = {
-            audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+              ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+            },
             video: false,
           };
           const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -682,16 +695,62 @@ export default function CandidateInterviewPage() {
       }
       setAgentState("speaking");
       setMicHint(`${name || interviewer} is speaking…`);
-      // Always use browser TTS. Waiting on server edge-tts was hanging /answer
-      // so the UI never heard Sarah and never reopened the mic.
-      if (playId === playIdRef.current) {
-        await speakBrowser(text, name || interviewer, playId);
+
+      // Keep mic meter alive so barge-in can hear the candidate over TTS.
+      void startLevelMeter(micDeviceIdRef.current || undefined);
+
+      const speakStartedAt = Date.now();
+      let loudHoldMs = 0;
+      const bargeTimer = window.setInterval(() => {
+        if (playId !== playIdRef.current) {
+          window.clearInterval(bargeTimer);
+          return;
+        }
+        if (Date.now() - speakStartedAt < BARGE_IN_GRACE_MS) return;
+        if (micLevelRef.current >= BARGE_IN_LEVEL) {
+          loudHoldMs += 80;
+          if (loudHoldMs >= BARGE_IN_HOLD_MS) {
+            window.clearInterval(bargeTimer);
+            // Abort current TTS turn
+            playIdRef.current += 1;
+            try {
+              window.speechSynthesis?.cancel();
+            } catch {
+              /* ignore */
+            }
+            if (audioRef.current) {
+              try {
+                audioRef.current.pause();
+              } catch {
+                /* ignore */
+              }
+            }
+            setMicHint("You jumped in — listening…");
+            setAgentState("listening");
+            window.setTimeout(() => {
+              if (!processingRef.current) startListeningRef.current();
+            }, 280);
+          }
+        } else {
+          loudHoldMs = Math.max(0, loudHoldMs - 50);
+        }
+      }, 80);
+
+      try {
+        if (playId === playIdRef.current) {
+          await speakBrowser(text, name || interviewer, playId);
+        }
+      } finally {
+        window.clearInterval(bargeTimer);
       }
+
       if (playId === playIdRef.current && !opts?.keepPinned) {
         setSpokenDisplay(text);
       }
+      // true = finished speaking; false = candidate barged in / aborted
+      return playId === playIdRef.current;
     },
-    [interviewer, speakBrowser]
+    [interviewer, speakBrowser, startLevelMeter]
   );
 
   const stopListening = useCallback(() => {
@@ -706,6 +765,7 @@ export default function CandidateInterviewPage() {
       maxRecTimerRef.current = null;
     }
     speechStartedRef.current = false;
+    speechStartedAtRef.current = 0;
     // Keep level meter running so bars stay live; only stop recognition/recorder
     try {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
@@ -728,11 +788,11 @@ export default function CandidateInterviewPage() {
 
   const openMicAfterAgent = useCallback(() => {
     setAgentState("listening");
-    setMicHint("Your turn — mic is open, speak now");
+    setMicHint("Your turn — mic is open. Speak, then pause ~3s when finished");
     // Slight delay so Sarah's last audio fully stops before we capture
     window.setTimeout(() => {
       if (!processingRef.current) startListeningRef.current();
-    }, 400);
+    }, 450);
   }, []);
 
   /** After Next.js remounts on URL change, restore question + reopen mic. */
@@ -846,20 +906,20 @@ export default function CandidateInterviewPage() {
         if (action === "AWAIT_ANSWER") {
           setMicHint("Still on this question — answer it, or say you don’t know");
           setTranscript((t) => [...t, { role: "interviewer", content: reply }]);
-          await playAgentSpeech(
+          const finished = await playAgentSpeech(
             "Still need your answer on that — take your time, or say you don’t know.",
             res.audio_base64,
             interviewer,
             { keepPinned: true }
           );
-          openMicAfterAgent();
+          if (finished) openMicAfterAgent();
           return;
         }
         setTopicLabel(res.topic?.label || null);
         setTranscript((t) => [...t, { role: "interviewer", content: reply }]);
         setMicHint(`${interviewer} is speaking…`);
-        await playAgentSpeech(reply, res.audio_base64, interviewer);
-        openMicAfterAgent();
+        const finished = await playAgentSpeech(reply, res.audio_base64, interviewer);
+        if (finished) openMicAfterAgent();
       } catch (e) {
         console.error("answer failed", e);
         setError(e instanceof Error ? e.message : "Failed to process answer");
@@ -878,11 +938,19 @@ export default function CandidateInterviewPage() {
     silenceTimerRef.current = setTimeout(() => {
       // Final chunks OR last interim (Chrome often never marks results final)
       const finalText = (answerBufferRef.current || lastHeardRef.current).trim();
+      const spokeLongEnough =
+        speechStartedAtRef.current > 0 &&
+        Date.now() - speechStartedAtRef.current >= MIN_SPEECH_BEFORE_COMMIT_MS;
       console.log("[mic] silence commit:", finalText || "(empty — no follow-up)");
       if (finalText && listeningRef.current && !processingRef.current) {
+        if (!spokeLongEnough) {
+          // Mid-sentence pause — keep listening a bit longer
+          armSilenceCommit();
+          return;
+        }
         submitAnswer(finalText);
       } else if (!finalText) {
-        setMicHint("Didn’t catch words — speak again, then pause ~2s");
+        setMicHint("Didn’t catch words — speak again, then pause ~3s");
       }
     }, SILENCE_MS);
   }, [clearSilenceTimer, submitAnswer]);
@@ -917,6 +985,7 @@ export default function CandidateInterviewPage() {
     const rawBlob = new Blob(recordedChunksRef.current, { type: rec.mimeType || "audio/webm" });
     recordedChunksRef.current = [];
     speechStartedRef.current = false;
+    speechStartedAtRef.current = 0;
     if (rawBlob.size < 2500) {
       setMicHint("Didn’t catch that — speak again, then tap I’m done");
       window.setTimeout(() => startListeningRef.current(), 400);
@@ -970,11 +1039,12 @@ export default function CandidateInterviewPage() {
     answerBufferRef.current = "";
     lastHeardRef.current = "";
     speechStartedRef.current = false;
+    speechStartedAtRef.current = 0;
     recordedChunksRef.current = [];
     setPartialHeard("");
     setAgentState("listening");
     listeningRef.current = true;
-    setMicHint("Listening — speak naturally, then pause ~2s");
+    setMicHint("Listening — speak naturally, then pause ~3s when done");
 
     if (audioRef.current) audioRef.current.pause();
 
@@ -1003,7 +1073,8 @@ export default function CandidateInterviewPage() {
             const total = recordedChunksRef.current.reduce((n, b) => n + b.size, 0);
             if (total > 2500 && !speechStartedRef.current) {
               speechStartedRef.current = true;
-              setMicHint("Hearing you… pause ~2s or tap I’m done");
+              speechStartedAtRef.current = Date.now();
+              setMicHint("Hearing you… pause ~3s when finished, or tap I’m done");
               setPartialHeard("…");
             }
           }
@@ -1014,7 +1085,14 @@ export default function CandidateInterviewPage() {
           if (vadTimerRef.current) clearTimeout(vadTimerRef.current);
           vadTimerRef.current = setTimeout(() => {
             if (!listeningRef.current || processingRef.current || !speechStartedRef.current) return;
-            if (micLevelRef.current > 0.035) {
+            if (micLevelRef.current > 0.04) {
+              armVadCommit();
+              return;
+            }
+            const spokeLongEnough =
+              speechStartedAtRef.current > 0 &&
+              Date.now() - speechStartedAtRef.current >= MIN_SPEECH_BEFORE_COMMIT_MS;
+            if (!spokeLongEnough) {
               armVadCommit();
               return;
             }
@@ -1024,10 +1102,11 @@ export default function CandidateInterviewPage() {
 
         const watch = () => {
           if (!listeningRef.current || processingRef.current) return;
-          if (micLevelRef.current > 0.028) {
+          if (micLevelRef.current > 0.03) {
             if (!speechStartedRef.current) {
               speechStartedRef.current = true;
-              setMicHint("Hearing you… pause ~2s or tap I’m done");
+              speechStartedAtRef.current = Date.now();
+              setMicHint("Hearing you… pause ~3s when finished, or tap I’m done");
               setPartialHeard("…");
             }
             armVadCommit();
@@ -1075,7 +1154,11 @@ export default function CandidateInterviewPage() {
       lastHeardRef.current = heard;
       setPartialHeard(heard);
       if (heard) {
-        setMicHint("Hearing you… pause when finished");
+        if (!speechStartedRef.current) {
+          speechStartedRef.current = true;
+          speechStartedAtRef.current = Date.now();
+        }
+        setMicHint("Hearing you… pause ~3s when finished");
         armSilenceCommit();
       }
     };
@@ -1341,9 +1424,9 @@ export default function CandidateInterviewPage() {
       setMicHint(`${res.interviewer_name || name} is speaking…`);
       console.log("%cAI:", "color:#2ec4b6;font-weight:bold", res.reply);
       // Prefer browser TTS for greeting (instant); server audio optional
-      await playAgentSpeech(res.reply, res.audio_base64, res.interviewer_name || name);
+      const finished = await playAgentSpeech(res.reply, res.audio_base64, res.interviewer_name || name);
       micOpenedTokens.add(activeToken);
-      openMicAfterAgent();
+      if (finished) openMicAfterAgent();
     } catch (e) {
       liveStartedTokens.delete(activeToken);
       startedForTokenRef.current = null;
