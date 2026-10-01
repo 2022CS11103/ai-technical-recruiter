@@ -570,11 +570,25 @@ a {
 }
 
 .micro-main.is-briefing {
-  grid-template-columns: 1fr minmax(280px, 380px);
-  gap: 2rem;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 360px);
+  gap: 1.5rem 2rem;
   align-items: center;
-  max-width: 1100px;
+  justify-items: stretch;
+  width: 100%;
+  max-width: min(1100px, 100%);
   margin: 0 auto;
+  padding-left: clamp(1rem, 3vw, 1.75rem);
+  padding-right: clamp(1rem, 3vw, 1.75rem);
+  box-sizing: border-box;
+}
+
+/* Stage area uses 94vw in live mode — that pushes the brief card off-screen. */
+.micro-main.is-briefing .micro-stage-area {
+  width: auto;
+  max-width: 100%;
+  margin-left: 0;
+  padding-right: 0;
+  justify-content: center;
 }
 
 @media (max-width: 900px) {
@@ -702,6 +716,9 @@ a {
 }
 
 .micro-brief {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
   background: rgba(255, 255, 255, 0.55);
   border: 1px solid rgba(255, 255, 255, 0.7);
   border-radius: 18px;
