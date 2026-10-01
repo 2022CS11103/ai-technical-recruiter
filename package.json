@@ -1,0 +1,13 @@
+{
+  "name": "ai-technical-recruiter",
+  "private": true,
+  "description": "Monorepo root — Vercel must use Root Directory apps/web (see docs/DEPLOY_VERCEL.md)",
+  "scripts": {
+    "build": "npm --prefix apps/web install && npm --prefix apps/web run build",
+    "dev:web": "npm --prefix apps/web run dev",
+    "start:web": "npm --prefix apps/web run start"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
